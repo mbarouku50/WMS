@@ -1,0 +1,56 @@
+# =====================================================================
+#  WMS - Apache configuration (root of the application)
+#  There is no public/ folder, so sensitive directories are protected
+#  here rather than by living outside the web root.
+# =====================================================================
+
+Options -Indexes
+DirectoryIndex index.php
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Block direct access to sensitive folders even if their own
+    # .htaccess is ignored (e.g. AllowOverride set too narrowly).
+    RewriteRule ^(config|core|classes|services|database|logs)/ - [F,L]
+
+    # Never serve the local configuration or the install lock.
+    RewriteRule ^config/app\.local\.php$ - [F,L]
+</IfModule>
+
+# Deny dotfiles and backup/editor leftovers.
+<FilesMatch "(^\.|\.(bak|config|dist|fla|inc|ini|log|psd|sh|sql|sw[op]|env|local\.php)|~)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set X-XSS-Protection "0"
+    # Uncomment once the site is served over HTTPS only:
+    # Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+</IfModule>
+
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css            "access plus 7 days"
+    ExpiresByType application/javascript "access plus 7 days"
+    ExpiresByType image/png           "access plus 30 days"
+    ExpiresByType image/jpeg          "access plus 30 days"
+    ExpiresByType image/svg+xml       "access plus 30 days"
+</IfModule>
+
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css application/javascript application/json text/plain
+</IfModule>
+
+php_flag display_errors off
+php_value upload_max_filesize 4M
+php_value post_max_size 8M
