@@ -130,6 +130,26 @@ try {
     $report[] = 'Billing: failed (see the log).';
 }
 
+/* ------------------------------------------------ fee enforcement ----- */
+/*
+ * Locks and releases are also decided when a provider opens their own
+ * account, so this is not the only path. It matters for the provider who
+ * never logs in: without it their network would keep selling indefinitely
+ * on an unpaid fee.
+ */
+try {
+    $enforced = (new BillingGuard())->sweep();
+    $report[] = sprintf(
+        'Fee enforcement: %d provider(s) checked, %d locked, %d with service stopped.',
+        $enforced['checked'],
+        $enforced['locked'],
+        $enforced['stopped']
+    );
+} catch (Throwable $e) {
+    Logger::error('Cron fee enforcement failed: ' . $e->getMessage());
+    $report[] = 'Fee enforcement: failed (see the log).';
+}
+
 /* ------------------------------------------------------- payouts ------ */
 try {
     $payouts = (new WalletService())->reconcileWithdrawals(25);
@@ -137,6 +157,18 @@ try {
 } catch (Throwable $e) {
     Logger::error('Cron payout reconciliation failed: ' . $e->getMessage());
     $report[] = 'Payouts: failed (see the log).';
+}
+
+/* ------------------------------------------- the platform's own payouts */
+try {
+    $mine = (new PlatformWalletService())->reconcile(25);
+    $report[] = sprintf(
+        'Platform payouts: %d checked, %d settled, %d failed.',
+        $mine['checked'], $mine['settled'], $mine['failed']
+    );
+} catch (Throwable $e) {
+    Logger::error('Cron platform payout reconciliation failed: ' . $e->getMessage());
+    $report[] = 'Platform payouts: failed (see the log).';
 }
 
 /* -------------------------------------------------------------- alerts */

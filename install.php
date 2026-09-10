@@ -242,26 +242,35 @@ if (is_post() && !$alreadyInstalled) {
                     /*
                      * Import order matters:
                      *   1. schema.sql   - the base tables
-                     *   2. upgrade_multi_provider.sql - providers, provider_id,
-                     *      the default provider, role/permission scopes
+                     *   2. the upgrade files, in the order they were written,
+                     *      each building on the one before
                      *   3. seed.sql     - optional demo data, which already
                      *      carries provider_id
                      *
-                     * The multi-provider file is the single source of truth
-                     * for the tenancy changes, so a fresh install and an
-                     * upgrade of an existing database run exactly the same
-                     * statements.
+                     * A fresh install runs exactly the same upgrade files as
+                     * an existing database being migrated. That is the whole
+                     * point: one source of truth per change, so a new
+                     * installation can never end up missing a table that an
+                     * upgraded one has. Every file is safe to run twice.
                      */
                     $schema = file_get_contents(DATABASE_PATH . '/schema.sql');
                     foreach (wms_split_sql((string)$schema) as $statement) {
                         $connection->query($statement);
                     }
 
-                    $upgrade = DATABASE_PATH . '/upgrade_multi_provider.sql';
-                    if (is_readable($upgrade)) {
-                        // This file defines stored procedures, so it needs the
-                        // DELIMITER-aware runner rather than the plain splitter.
-                        wms_run_sql_file($connection, (string)file_get_contents($upgrade));
+                    foreach ([
+                        'upgrade_multi_provider.sql',        // providers, provider_id, scoped roles
+                        'upgrade_provider_billing.sql',      // wallets, withdrawals, platform invoices
+                        'upgrade_network_production.sql',    // live router monitoring
+                        'upgrade_platform_fee_enforcement.sql', // locking an unpaid provider out
+                        'upgrade_platform_payouts.sql',      // the platform's own withdrawals
+                    ] as $upgradeFile) {
+                        $upgrade = DATABASE_PATH . '/' . $upgradeFile;
+                        if (is_readable($upgrade)) {
+                            // These files define stored procedures, so they need
+                            // the DELIMITER-aware runner, not the plain splitter.
+                            wms_run_sql_file($connection, (string)file_get_contents($upgrade));
+                        }
                     }
 
                     /* demo data (optional) */

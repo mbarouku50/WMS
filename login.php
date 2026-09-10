@@ -52,6 +52,31 @@ if (is_post()) {
             $redirect = Session::get('redirect_after_login');
             Session::forget('redirect_after_login');
             Session::flash('success', $result['message']);
+
+            /*
+             * The platform fee, if it is actually pressing.
+             *
+             * Only two things justify taking somebody to a payment screen
+             * instead of their own dashboard: the deadline has passed, or it
+             * is within the reminder window (three days by default). An
+             * invoice raised three weeks early is mentioned on the dashboard
+             * bar and nothing more - interrupting a working business over a
+             * bill that is not yet due is how software gets resented.
+             */
+            if (ProviderContext::isProviderUser() && ProviderContext::providerId() !== null) {
+                try {
+                    $fee = (new BillingGuard())->state(ProviderContext::providerId(), false);
+                    if ($fee['urgent']) {
+                        Session::flash($fee['locked'] ? 'error' : 'warning',
+                            $fee['headline'] . '. ' . $fee['detail']);
+                        header('Location: ' . url(BillingGuard::PAY_PAGE));
+                        exit;
+                    }
+                } catch (Throwable $e) {
+                    Logger::error('Could not check the platform fee at sign in: ' . $e->getMessage());
+                }
+            }
+
             header('Location: ' . ($redirect && str_contains((string)$redirect, '/admin/') ? $redirect : url('admin/index.php')));
             exit;
         }

@@ -74,13 +74,34 @@ class PlatformInvoice extends Model
         return $number;
     }
 
-    /** Has this provider already been invoiced for this period? */
+    /**
+     * Has this provider already been invoiced for this period?
+     *
+     * A cancelled invoice does not count. Cancelling is how a terms change
+     * withdraws a demand, and if that also barred the period for ever, an
+     * owner who moved a start date forward and then back again would
+     * silently never be paid for those months - the unique key on
+     * (provider_id, period_start) would refuse the new row and nothing
+     * would say why.
+     */
     public function existsForPeriod(int $providerId, string $periodStart): bool
     {
         return $this->db->count(
-            'SELECT COUNT(*) FROM platform_invoices WHERE provider_id = ? AND period_start = ?',
+            "SELECT COUNT(*) FROM platform_invoices
+              WHERE provider_id = ? AND period_start = ? AND status <> 'cancelled'",
             [$providerId, $periodStart]
         ) > 0;
+    }
+
+    /** A cancelled invoice occupying a period that is being billed again. */
+    public function cancelledForPeriod(int $providerId, string $periodStart): ?array
+    {
+        return $this->db->fetchOne(
+            "SELECT * FROM platform_invoices
+              WHERE provider_id = ? AND period_start = ? AND status = 'cancelled'
+              ORDER BY id DESC LIMIT 1",
+            [$providerId, $periodStart]
+        ) ?: null;
     }
 
     public function unpaidFor(int $providerId): array
@@ -116,14 +137,47 @@ class PlatformInvoice extends Model
     }
 
     /** Invoices that are due and could be settled from a wallet. */
-    public function dueForCollection(int $limit = 100): array
+    public function dueForCollection(int $limit = 100, ?int $providerId = null): array
     {
+        $scope  = $providerId === null ? '' : ' AND i.provider_id = ?';
+        $params = $providerId === null ? [] : [$providerId];
+
         return $this->db->fetchAll(
             "SELECT i.*, pr.wallet_balance, pr.business_name
                FROM platform_invoices i
                JOIN providers pr ON pr.id = i.provider_id
-              WHERE i.status = 'unpaid' AND i.due_on <= CURDATE()
-              ORDER BY i.due_on ASC LIMIT " . (int)$limit
+              WHERE i.status = 'unpaid' AND i.due_on <= CURDATE()" . $scope . "
+              ORDER BY i.due_on ASC LIMIT " . (int)$limit,
+            $params
+        );
+    }
+
+    /** The single oldest unpaid invoice, which is the one that must be paid first. */
+    public function oldestUnpaid(int $providerId): ?array
+    {
+        return $this->db->fetchOne(
+            "SELECT * FROM platform_invoices
+              WHERE provider_id = ? AND status = 'unpaid'
+              ORDER BY due_on ASC, id ASC LIMIT 1",
+            [$providerId]
+        ) ?: null;
+    }
+
+    /** Providers currently shut out over an unpaid fee, for the platform screen. */
+    public function lockedProviders(): array
+    {
+        return $this->db->fetchAll(
+            "SELECT pr.id, pr.business_name, pr.provider_code, pr.billing_locked_at,
+                    pr.service_suspended_at, pr.billing_grace_until, pr.wallet_balance,
+                    COALESCE(SUM(i.amount),0) AS owed,
+                    MIN(i.due_on) AS oldest_due
+               FROM providers pr
+               LEFT JOIN platform_invoices i
+                      ON i.provider_id = pr.id AND i.status = 'unpaid'
+              WHERE pr.billing_locked_at IS NOT NULL OR pr.service_suspended_at IS NOT NULL
+              GROUP BY pr.id, pr.business_name, pr.provider_code, pr.billing_locked_at,
+                       pr.service_suspended_at, pr.billing_grace_until, pr.wallet_balance
+              ORDER BY pr.service_suspended_at IS NULL, pr.billing_locked_at ASC"
         );
     }
 }

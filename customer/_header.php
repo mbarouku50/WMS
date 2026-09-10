@@ -39,6 +39,20 @@ $portalChoices    = $portalProviderId === null ? ProviderContext::portalChoices(
  */
 $portalCanBuy = $portalProvider !== null && (int)($portalProvider['mobile_money_enabled'] ?? 0) === 1;
 
+/*
+ * The operator behind this network has not paid their platform fee, so the
+ * network has stopped selling. Buying and activating both disappear, and the
+ * visitor is told plainly rather than left pressing a button that fails.
+ *
+ * As everywhere else in the portal, hiding is the courtesy: the refusal
+ * itself lives in PaymentService and VoucherService, where a saved link or a
+ * hand-made POST also has to pass.
+ */
+$portalServiceStopped = BillingGuard::serviceStopped($portalProviderId);
+if ($portalServiceStopped) {
+    $portalCanBuy = false;
+}
+
 $activeTab    = $activeTab ?? '';
 $portalBack   = $portalBack ?? null;
 
@@ -159,6 +173,13 @@ $portalCustomer = Auth::customer();
     <?php endif; ?>
 
     <?= flash_messages() ?>
+
+    <?php if ($portalServiceStopped): ?>
+        <?= alert_box('warning',
+            'This network is not selling or activating vouchers at the moment. If you are already online you will '
+            . 'stay online until your package runs out. Please ask the operator when it will be back.',
+            'Temporarily unavailable') ?>
+    <?php endif; ?>
 
     <?php if ($portalPicking): ?>
         <!-- More than one provider runs on this platform and the router did

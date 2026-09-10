@@ -111,6 +111,13 @@ require INCLUDES_PATH . '/admin-header.php';
                             <span class="alert-row__title"><?= e($alert['title']) ?></span>
                             <?= badge($alert['severity'] === 'critical' ? 'blocked' : $alert['severity'], ucfirst($alert['severity'])) ?>
                             <span class="pill"><?= e(label($alert['type'])) ?></span>
+                            <?php if (ProviderContext::isGlobalScope()): ?>
+                                <!-- Whose alert this is. A platform administrator sees
+                                     every tenant's, and several of them are written to
+                                     the provider in the second person - without this
+                                     there is no telling who "you" is. -->
+                                <span class="pill"><?= icon('building', 'ico--sm') ?><?= e($alert['provider_name'] ?? 'Platform') ?></span>
+                            <?php endif; ?>
                             <?php if ($alert['is_resolved']): ?>
                                 <span class="badge badge--success">Resolved</span>
                             <?php endif; ?>

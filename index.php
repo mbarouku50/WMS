@@ -108,7 +108,7 @@ require INCLUDES_PATH . '/navbar.php';
              couple of seconds whether they are in the right place. -->
         <div class="nhero__head">
             <span class="nhero__kicker">Hotspot control · MikroTik RouterOS</span>
-            <h1><em>Sell Wi-Fi</em> by the hour.</h1>
+            <h1><em>Sell Internet</em> by the hour.</h1>
             <p class="nhero__lead">
                 Vouchers, mobile money and the routers that carry the traffic — one system,
             </p>

@@ -48,6 +48,24 @@ if (ProviderContext::isProviderUser() && ProviderContext::providerId() === null)
     exit;
 }
 
+/*
+ * The platform fee.
+ *
+ * A provider who has not paid past the deadline still gets through the door
+ * - they have to, or they could never pay - but the only screen they can
+ * reach is the one that takes the payment. Everything else redirects there
+ * until the invoice is settled.
+ *
+ * Platform staff are never held here: the fee is owed to them.
+ */
+try {
+    (new BillingGuard())->enforceAdmin();
+} catch (Throwable $e) {
+    // A failure to evaluate the fee must never lock a paying provider out of
+    // their own business. Log it and let the request through.
+    Logger::error('Platform fee enforcement could not run: ' . $e->getMessage(), ['user_id' => Auth::id()]);
+}
+
 // Light housekeeping so expiry never depends on a cron job being set up.
 if (random_int(1, 12) === 1) {
     try {

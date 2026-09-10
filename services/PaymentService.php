@@ -100,6 +100,18 @@ class PaymentService
         }
 
         /*
+         * The operator's own platform fee is unpaid and their network has
+         * stopped selling. Taking this customer's money would be taking it
+         * for a service that is switched off.
+         */
+        if (BillingGuard::serviceStopped((int)$package['provider_id'])) {
+            Logger::payment('Purchase refused - the network has stopped over an unpaid platform fee', [
+                'provider_id' => (int)$package['provider_id'],
+            ]);
+            return ['ok' => false, 'message' => BillingGuard::serviceStoppedMessage()];
+        }
+
+        /*
          * Selling by mobile money is a privilege the platform owner grants
          * per provider. Until they do, the provider sells through vouchers
          * only - so this is refused on the server, not merely hidden.

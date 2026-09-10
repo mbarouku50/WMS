@@ -699,25 +699,80 @@
     }, true);
     window.addEventListener('resize', function () { closeDropdowns(null); });
 
+    /*
+     * Remember which button submitted a form.
+     *
+     * e.submitter gives this directly in current browsers; this keeps an
+     * older one working too. Captured on the way down so it is already
+     * recorded by the time the submit event fires.
+     */
+    var lastSubmitter = null;
+    document.addEventListener('click', function (e) {
+        var button = e.target.closest('button, input[type="submit"], input[type="image"]');
+        if (button && (button.type === 'submit' || button.type === 'image')) { lastSubmitter = button; }
+    }, true);
+
+    /** The control that triggered this submit, or null. */
+    function submitterOf(e) {
+        if (e.submitter) { return e.submitter; }
+        return (lastSubmitter && lastSubmitter.form === e.target) ? lastSubmitter : null;
+    }
+
     /* Any form marked data-confirm asks first. */
     document.addEventListener('submit', function (e) {
         var form = e.target;
         if (!form.hasAttribute('data-confirm') || form.dataset.confirmed === '1') { return; }
         e.preventDefault();
+
+        /*
+         * The catch that made every confirmed action fail:
+         *
+         * form.submit() does NOT send the button that triggered the submit.
+         * Nearly every action in WMS rides on that button - a row of
+         * <button name="action" value="delete"> sharing one form - so
+         * resubmitting after the dialog arrived with no action at all, and
+         * the page answered "That action is not supported."
+         *
+         * So the submitter is captured before the dialog opens and carried
+         * across as a hidden field. Anything else the button carried (a row
+         * id on a bulk bar, say) travels with it.
+         */
+        var submitter = submitterOf(e);
+
         WMS.confirm({
             title: form.getAttribute('data-confirm-title') || 'Please confirm',
             message: form.getAttribute('data-confirm'),
             confirmText: form.getAttribute('data-confirm-button') || 'Continue',
             tone: form.getAttribute('data-confirm-tone') || 'danger'
         }).then(function (ok) {
-            if (ok) { form.dataset.confirmed = '1'; form.submit(); }
+            if (!ok) { return; }
+
+            if (submitter && submitter.name && !form.querySelector('[data-submitter-carry]')) {
+                var carry = document.createElement('input');
+                carry.type = 'hidden';
+                carry.name = submitter.name;
+                carry.value = submitter.value;
+                carry.setAttribute('data-submitter-carry', '1');
+                form.appendChild(carry);
+            }
+
+            form.dataset.confirmed = '1';
+            form.submit();
         });
     });
 
-    /* Submitting a form puts its primary button into the loading state. */
+    /* Submitting a form puts the button that was actually pressed into the
+       loading state - not merely the first one in the form, which on a row
+       of actions is rarely the one the operator clicked. */
     document.addEventListener('submit', function (e) {
-        var button = e.target.querySelector('[type="submit"]:not([data-no-loading])');
-        if (button && !e.defaultPrevented) { setTimeout(function () { WMS.loading(button); }, 0); }
+        if (e.defaultPrevented) { return; }
+        var button = submitterOf(e);
+        if (!button || button.hasAttribute('data-no-loading')) {
+            button = e.target.querySelector('[type="submit"]:not([data-no-loading])');
+        }
+        if (button && !button.hasAttribute('data-no-loading')) {
+            setTimeout(function () { WMS.loading(button); }, 0);
+        }
     });
 
     /* Filter bars submit themselves when a select changes. */
@@ -756,6 +811,45 @@
         var counter = $('[data-bulk-count]', bar);
         if (counter) { counter.textContent = String(count); }
     }
+
+    /*
+     * Carry the ticked rows into the bulk action form.
+     *
+     * The bulk bar sits above the table, so the checkboxes are not inside
+     * its <form> and the browser never sends them - every bulk action
+     * arrived with an empty ids[] and was refused with "select at least one
+     * row first", however many rows were ticked. They are collected here at
+     * the moment of submission instead.
+     *
+     * This runs on the first submit event, which fires even when the
+     * confirm dialog then cancels it, so the ids are already in place by
+     * the time the dialog re-submits the form.
+     */
+    document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form.matches || !form.matches('[data-bulk-form]')) { return; }
+
+        $$('[data-bulk-id]', form).forEach(function (old) { old.remove(); });
+
+        var checked = $$('input[type="checkbox"][name="ids[]"]:checked');
+        if (!checked.length) {
+            // Stopped in the capture phase, so the confirm dialog below never
+            // gets the event and cannot re-submit the form behind this guard.
+            e.preventDefault();
+            e.stopPropagation();
+            WMS.toast('Tick at least one row first.', 'warning');
+            return;
+        }
+
+        checked.forEach(function (box) {
+            var carry = document.createElement('input');
+            carry.type = 'hidden';
+            carry.name = 'ids[]';
+            carry.value = box.value;
+            carry.setAttribute('data-bulk-id', '1');
+            form.appendChild(carry);
+        });
+    }, true);
     WMS.updateBulkBar = updateBulkBar;
 
     /* Progressive relative timestamps. */

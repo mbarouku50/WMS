@@ -13,6 +13,8 @@ require_once INCLUDES_PATH . '/components.php';
 
 $billing     = new BillingService();
 $wallet      = new WalletService();
+$platform    = new PlatformWalletService();
+$myPayouts   = new PlatformPayout();
 $withdrawals = new Withdrawal();
 $invoices    = new PlatformInvoice();
 $providers   = new Provider();
@@ -66,6 +68,45 @@ if (is_post()) {
             Response::back($result['ok'] ? 'success' : 'error', $result['message']);
             break;
 
+        case 'platform_withdraw':
+            // The owner paying themselves. No approval step: they are the
+            // approver, so this validates and sends in one movement.
+            $result = $platform->withdraw([
+                'amount'         => post('amount'),
+                'method'         => post('method'),
+                'account_number' => post('account_number'),
+                'account_name'   => post('account_name'),
+                'note'           => post('note'),
+            ]);
+            Response::back($result['ok'] ? 'success' : 'error', $result['message']);
+            break;
+
+        case 'platform_payout_complete':
+            $result = $platform->complete($id);
+            Response::back($result['ok'] ? 'success' : 'error', $result['message']);
+            break;
+
+        case 'platform_payout_failed':
+            $result = $platform->fail($id, post('reason', 'Marked failed by the platform owner'));
+            Response::back($result['ok'] ? 'warning' : 'error', $result['message']);
+            break;
+
+        case 'grant_grace':
+            $providerId = (int)post('provider_id');
+            $until      = post('until');
+            if ($providerId <= 0 || $until === '') {
+                Response::back('error', 'Choose a provider and the date the extension runs to.');
+            }
+            $result = (new BillingGuard())->grantGrace($providerId, $until,
+                Validator::string(post('reason'), 200) ?: 'Extension granted by the platform');
+            Response::back($result['ok'] ? 'success' : 'error', $result['message']);
+            break;
+
+        case 'revoke_grace':
+            $result = (new BillingGuard())->revokeGrace((int)post('provider_id'));
+            Response::back($result['ok'] ? 'warning' : 'error', $result['message']);
+            break;
+
         case 'adjust':
             $providerId = (int)post('provider_id');
             $amount     = (float)post('amount');
@@ -90,13 +131,15 @@ if (is_post()) {
 }
 
 $tab = query('tab', 'overview');
-if (!in_array($tab, ['overview', 'withdrawals', 'invoices', 'wallets'], true)) {
+if (!in_array($tab, ['overview', 'my-money', 'withdrawals', 'invoices', 'wallets'], true)) {
     $tab = 'overview';
 }
 
 $summary        = $billing->platformSummary();
 $pendingPayouts = $withdrawals->pendingApproval(20);
 $providerList   = $providers->listAll();
+$lockedProviders = $invoices->lockedProviders();
+$myBalance       = $platform->balance();
 
 $pageTitle    = 'Billing';
 $pageSubtitle = 'Provider wallets, platform fees and payouts';
@@ -126,12 +169,101 @@ require INCLUDES_PATH . '/admin-header.php';
 </div>
 
 <div class="tabs mb-3">
-    <?php foreach (['overview' => 'Overview', 'withdrawals' => 'Withdrawals', 'invoices' => 'Invoices', 'wallets' => 'Provider wallets'] as $key => $label): ?>
+    <?php foreach (['overview' => 'Overview', 'my-money' => 'My money', 'withdrawals' => 'Withdrawals', 'invoices' => 'Invoices', 'wallets' => 'Provider wallets'] as $key => $label): ?>
         <a class="tab<?= $tab === $key ? ' is-active' : '' ?>" href="<?= e(url('admin/billing/index.php?tab=' . $key)) ?>"><?= e($label) ?></a>
     <?php endforeach; ?>
 </div>
 
 <?php if ($tab === 'overview'): ?>
+
+    <?php if ($lockedProviders): ?>
+        <!-- Providers the system has shut out over an unpaid fee. This is the
+             sharpest thing WMS does to a customer of yours, so it is stated
+             plainly and the way to undo it is right here: collect the money,
+             mark it received, or give them more time. -->
+        <section class="card mb-3">
+            <div class="card__head">
+                <div>
+                    <h2 class="card__title"><?= icon('lock') ?> Locked over an unpaid fee</h2>
+                    <p class="card__subtitle">They can sign in only to pay. A stopped network cannot sell at all.</p>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="table table--stack">
+                    <thead>
+                        <tr>
+                            <th>Provider</th><th class="text-right">Owed</th><th>Was due</th>
+                            <th>State</th><th class="text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ($lockedProviders as $locked): ?>
+                        <tr>
+                            <td data-label="Provider">
+                                <a href="<?= e(url('admin/providers/view.php?id=' . (int)$locked['id'])) ?>"><?= e($locked['business_name']) ?></a>
+                                <div class="tiny faint"><?= e((string)$locked['provider_code']) ?></div>
+                            </td>
+                            <td data-label="Owed" class="text-right nowrap strong"><?= e(money((float)$locked['owed'])) ?></td>
+                            <td data-label="Was due" class="nowrap">
+                                <?= $locked['oldest_due'] ? e(format_date($locked['oldest_due'], 'd M Y')) : '—' ?>
+                            </td>
+                            <td data-label="State">
+                                <?= $locked['service_suspended_at']
+                                        ? badge('blocked', 'Service stopped')
+                                        : badge('suspended', 'Account locked') ?>
+                                <div class="tiny faint mt-1">since <?= e(time_ago($locked['billing_locked_at'])) ?></div>
+                            </td>
+                            <td data-label="Actions" class="text-right">
+                                <div class="dropdown">
+                                    <button type="button" class="btn btn--sm" data-dropdown="lock-<?= (int)$locked['id'] ?>">
+                                        <?= icon('more', 'ico--sm') ?> Release
+                                    </button>
+                                    <div class="dropdown__menu" id="lock-<?= (int)$locked['id'] ?>">
+                                        <form method="post">
+                                            <?= CSRF::field() ?>
+                                            <input type="hidden" name="action" value="grant_grace">
+                                            <input type="hidden" name="provider_id" value="<?= (int)$locked['id'] ?>">
+                                            <div class="dropdown__label">Give them more time</div>
+                                            <div style="padding:.4rem .7rem">
+                                                <input class="input" type="date" name="until"
+                                                       min="<?= e(date('Y-m-d')) ?>"
+                                                       value="<?= e(date('Y-m-d', strtotime('+7 days'))) ?>">
+                                            </div>
+                                            <button class="dropdown__item" type="submit">
+                                                <?= icon('clock', 'ico--sm') ?> Unlock until that date
+                                            </button>
+                                        </form>
+                                        <?php if ($locked['billing_grace_until']): ?>
+                                            <div class="dropdown__divider"></div>
+                                            <form method="post" data-confirm="End this extension now? The usual deadlines apply again.">
+                                                <?= CSRF::field() ?>
+                                                <input type="hidden" name="provider_id" value="<?= (int)$locked['id'] ?>">
+                                                <button class="dropdown__item dropdown__item--danger" name="action" value="revoke_grace">
+                                                    <?= icon('x', 'ico--sm') ?> End the extension
+                                                </button>
+                                            </form>
+                                        <?php endif; ?>
+                                        <div class="dropdown__divider"></div>
+                                        <a class="dropdown__item" href="<?= e(url('admin/billing/index.php?tab=invoices&provider_id=' . (int)$locked['id'])) ?>">
+                                            <?= icon('report', 'ico--sm') ?> Their invoices
+                                        </a>
+                                    </div>
+                                </div>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <div class="card__body">
+                <p class="small faint mb-0">
+                    Marking an invoice paid, collecting it from a wallet, or waiving it all release the provider
+                    immediately — there is no separate unlock to remember.
+                </p>
+            </div>
+        </section>
+    <?php endif; ?>
+
     <div class="grid grid--2">
         <section class="card">
             <div class="card__head">
@@ -215,6 +347,214 @@ require INCLUDES_PATH . '/admin-header.php';
                     </table>
                 <?php endif; ?>
             </div>
+        </section>
+    </div>
+
+<?php elseif ($tab === 'my-money'): ?>
+    <?php
+    /*
+     * The platform owner's own money.
+     *
+     * The distinction this screen has to make honestly: the merchant
+     * account holds two different kinds of money, and only one of them is
+     * the owner's to take. Fees collected are theirs. Provider wallet
+     * balances sit in the same account and are not.
+     */
+    $payoutPage = $myPayouts->search(['status' => query('status')], current_page(), 20);
+    ?>
+
+    <div class="stat-grid mb-3">
+        <?= stat_card([
+            'label' => 'Yours to withdraw',
+            'value' => money($myBalance['available']),
+            'icon'  => 'money',
+            'tone'  => $myBalance['available'] > 0 ? 'success' : 'neutral',
+            'meta'  => $myBalance['in_flight'] > 0
+                ? money($myBalance['in_flight']) . ' already on its way out'
+                : 'Fees collected, less what you have taken',
+        ]) ?>
+        <?= stat_card([
+            'label' => 'Fees collected',
+            'value' => money($myBalance['earned']),
+            'icon'  => 'trend-up',
+            'tone'  => 'primary',
+            'meta'  => money($myBalance['collected_month']) . ' this month',
+        ]) ?>
+        <?= stat_card([
+            'label' => 'Withdrawn so far',
+            'value' => money($myBalance['paid_out']),
+            'icon'  => 'download',
+            'tone'  => 'neutral',
+            'meta'  => $myBalance['payout_fees'] > 0
+                ? money($myBalance['payout_fees']) . ' paid in payout charges'
+                : 'No payout charges yet',
+        ]) ?>
+        <?= stat_card([
+            'label' => 'Held for providers',
+            'value' => money($myBalance['owed_to_providers']),
+            'icon'  => 'card',
+            'tone'  => 'warning',
+            'meta'  => 'In your account, but not yours',
+        ]) ?>
+    </div>
+
+    <?= alert_box('info',
+        'Your merchant account holds ' . money($myBalance['in_merchant_account']) . ' in total. '
+        . money($myBalance['available']) . ' of that is fee income you can take. The other '
+        . money($myBalance['owed_to_providers']) . ' belongs to providers and is what you pay them with when '
+        . 'they withdraw — WMS will not let you draw it down.',
+        'What is actually yours') ?>
+
+    <div class="grid grid--1-2">
+        <!-- =============================================== take money out -->
+        <section class="card">
+            <div class="card__head">
+                <div>
+                    <h2 class="card__title"><?= icon('download') ?> Withdraw your fees</h2>
+                    <p class="card__subtitle">Straight to your own bank or mobile money</p>
+                </div>
+            </div>
+            <div class="card__body">
+                <?php if ($myBalance['available'] < (float)setting('platform_withdrawal_minimum', 5000)): ?>
+                    <?= empty_state([
+                        'icon'  => 'money',
+                        'title' => 'Nothing to withdraw yet',
+                        'text'  => 'You have ' . money($myBalance['available']) . ' in collected fees. The smallest '
+                                 . 'withdrawal is ' . money((float)setting('platform_withdrawal_minimum', 5000)) . '.',
+                    ]) ?>
+                <?php else: ?>
+                    <form method="post" action=""
+                          data-confirm="Send this money to your own account? This moves real money."
+                          data-confirm-tone="primary" data-confirm-button="Send it">
+                        <?= CSRF::field() ?>
+                        <input type="hidden" name="action" value="platform_withdraw">
+
+                        <?= field_input([
+                            'name'     => 'amount',
+                            'type'     => 'number',
+                            'label'    => 'Amount',
+                            'required' => true,
+                            'value'    => (string)$myBalance['available'],
+                            'hint'     => 'Up to ' . money($myBalance['available']) . '.',
+                            'attrs'    => 'min="' . (float)setting('platform_withdrawal_minimum', 5000)
+                                        . '" max="' . $myBalance['available'] . '" step="1"',
+                        ]) ?>
+
+                        <?= field_select([
+                            'name'     => 'method',
+                            'label'    => 'Send it to',
+                            'required' => true,
+                            'options'  => Withdrawal::METHODS,
+                        ]) ?>
+
+                        <?= field_input([
+                            'name'        => 'account_number',
+                            'label'       => 'Account or phone number',
+                            'required'    => true,
+                            'placeholder' => '0712 345 678',
+                        ]) ?>
+
+                        <?= field_input([
+                            'name'        => 'account_name',
+                            'label'       => 'Name on the account',
+                            'required'    => true,
+                            'placeholder' => 'As registered with the bank or wallet',
+                        ]) ?>
+
+                        <?= field_input([
+                            'name'        => 'note',
+                            'label'       => 'Note (optional)',
+                            'placeholder' => 'What this withdrawal was for',
+                        ]) ?>
+
+                        <button class="btn btn--primary btn--block" type="submit">
+                            <?= icon('download', 'ico--sm') ?> Withdraw
+                        </button>
+                    </form>
+                <?php endif; ?>
+            </div>
+        </section>
+
+        <!-- ================================================== the history -->
+        <section class="card">
+            <div class="card__head">
+                <div>
+                    <h2 class="card__title"><?= icon('history') ?> Your withdrawals</h2>
+                    <p class="card__subtitle">Every payout you have taken from fee income</p>
+                </div>
+            </div>
+
+            <div class="table-wrap">
+                <?php if (!$payoutPage['rows']): ?>
+                    <?= empty_state([
+                        'icon'  => 'download',
+                        'title' => 'You have not withdrawn anything yet',
+                        'text'  => 'Fees you collect build up here until you take them out.',
+                    ]) ?>
+                <?php else: ?>
+                    <table class="table table--stack">
+                        <thead>
+                            <tr>
+                                <th>Reference</th><th class="text-right">Amount</th>
+                                <th>Sent to</th><th>Status</th><th>When</th>
+                                <th class="text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach ($payoutPage['rows'] as $payout): ?>
+                            <tr>
+                                <td data-label="Reference">
+                                    <?= code_chip($payout['reference']) ?>
+                                    <?php if (!empty($payout['note'])): ?>
+                                        <div class="tiny faint"><?= e((string)$payout['note']) ?></div>
+                                    <?php endif; ?>
+                                </td>
+                                <td data-label="Amount" class="text-right nowrap strong">
+                                    <?= e(money((float)$payout['amount'])) ?>
+                                    <?php if ((float)$payout['fee'] > 0): ?>
+                                        <div class="tiny faint"><?= e(money((float)$payout['net_amount'])) ?> after charges</div>
+                                    <?php endif; ?>
+                                </td>
+                                <td data-label="Sent to">
+                                    <?= e((string)$payout['method']) ?>
+                                    <div class="tiny faint"><?= e((string)$payout['account_number']) ?></div>
+                                </td>
+                                <td data-label="Status">
+                                    <?= badge($payout['status'] === 'completed' ? 'successful' : $payout['status'],
+                                              PlatformPayout::STATUSES[$payout['status']] ?? label($payout['status'])) ?>
+                                    <?php if (!empty($payout['failure_reason'])): ?>
+                                        <div class="tiny" style="color:var(--wms-danger)"><?= e((string)$payout['failure_reason']) ?></div>
+                                    <?php endif; ?>
+                                </td>
+                                <td data-label="When" class="nowrap">
+                                    <?= e(format_date($payout['created_at'], 'd M Y')) ?>
+                                    <div class="tiny faint"><?= e(time_ago($payout['created_at'])) ?></div>
+                                </td>
+                                <td data-label="Actions" class="text-right">
+                                    <?php if ($payout['status'] === 'processing'): ?>
+                                        <!-- SonicPesa is polled by cron, but a payout you
+                                             can see landed should not need to wait for it. -->
+                                        <form method="post" style="display:inline" data-confirm="Mark this payout as completed?">
+                                            <?= CSRF::field() ?><input type="hidden" name="id" value="<?= (int)$payout['id'] ?>">
+                                            <button class="btn btn--sm" name="action" value="platform_payout_complete">Completed</button>
+                                        </form>
+                                        <form method="post" style="display:inline" data-confirm="Mark as failed? The amount becomes available to withdraw again.">
+                                            <?= CSRF::field() ?><input type="hidden" name="id" value="<?= (int)$payout['id'] ?>">
+                                            <button class="btn btn--sm btn--danger" name="action" value="platform_payout_failed"><?= icon('x', 'ico--sm') ?></button>
+                                        </form>
+                                    <?php else: ?>
+                                        <span class="faint tiny">
+                                            <?= $payout['completed_at'] ? e(format_date($payout['completed_at'], 'd M H:i')) : '—' ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php endif; ?>
+            </div>
+            <?= pagination($payoutPage, 'withdrawals') ?>
         </section>
     </div>
 

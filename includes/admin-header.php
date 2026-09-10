@@ -58,6 +58,37 @@ try {
         </div>
     <?php endif; ?>
 
+    <?php
+    /*
+     * The platform fee, on every screen until it is paid.
+     *
+     * A provider only reaches the admin shell while they are NOT locked -
+     * once the deadline passes auth-check keeps them on the pay screen - so
+     * this bar is the warning phase: the amount, the deadline, and one tap
+     * to settle it. Better a countdown they cannot miss than a lock that
+     * arrives as a surprise.
+     */
+    $feeBanner = null;
+    if (ProviderContext::isProviderUser() && ProviderContext::providerId() !== null) {
+        try {
+            $feeBanner = (new BillingGuard())->state(ProviderContext::providerId());
+        } catch (Throwable $e) {
+            $feeBanner = null;
+        }
+    }
+    ?>
+    <?php if ($feeBanner && $feeBanner['warn'] && !$feeBanner['locked']): ?>
+        <div class="impersonation-bar">
+            <span>
+                <?= icon('money', 'ico--sm') ?>
+                <b><?= e($feeBanner['headline']) ?></b> — <?= e($feeBanner['detail']) ?>
+            </span>
+            <a class="btn btn--sm" href="<?= e(url(BillingGuard::PAY_PAGE)) ?>">
+                <?= icon('card', 'ico--sm') ?> Pay now
+            </a>
+        </div>
+    <?php endif; ?>
+
     <header class="topbar">
         <button type="button" class="icon-btn topbar__toggle" data-sidebar-toggle aria-label="Open navigation">
             <?= icon('menu') ?>

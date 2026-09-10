@@ -114,7 +114,10 @@
                         'type'  => 'date',
                         'label' => 'Billing starts on',
                         'value' => (string)($values['billing_starts_on'] ?? ''),
-                        'hint'  => 'Change this to move the agreed start date.',
+                        'hint'  => 'Move this to a future date to give them more time: any unpaid invoice '
+                                 . 'for an earlier period is cancelled and any lock is lifted. A past date '
+                                 . 'bills them now, with '
+                                 . (int)setting('platform_fee_due_days', 7) . ' days from today to pay.',
                     ]) ?>
                     <?= field_select([
                         'name'    => 'billing_status',

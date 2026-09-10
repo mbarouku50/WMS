@@ -202,6 +202,22 @@ class VoucherService
             if ($provider && $provider['status'] !== 'active') {
                 return ['ok' => false, 'message' => 'This Wi-Fi service is temporarily unavailable. Please contact the operator.'];
             }
+
+            /*
+             * The operator has not paid their platform fee, so this network
+             * has stopped selling. Refused on the server, not merely hidden
+             * on the portal - a saved link or a direct POST arrives here too.
+             *
+             * Note what this does NOT do: a customer already online on a
+             * package they paid for stays online. Their session is not cut,
+             * because the debt is the operator's, not theirs.
+             */
+            if (BillingGuard::serviceStopped($voucherProvider)) {
+                Logger::warning('Voucher activation refused - the network has stopped over an unpaid platform fee', [
+                    'provider_id' => $voucherProvider,
+                ]);
+                return ['ok' => false, 'message' => BillingGuard::serviceStoppedMessage()];
+            }
         }
 
         // Refresh derived state before judging it.

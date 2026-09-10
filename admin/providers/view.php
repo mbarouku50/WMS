@@ -43,6 +43,7 @@ $revenueSeries = $db->fetchAll(
 );
 $activity = (new AuditLog())->forProvider($id, 8);
 $billing  = (new BillingService())->terms($id);
+$feeState = (new BillingGuard())->state($id);
 $payouts  = $db->fetchAll(
     'SELECT * FROM withdrawals WHERE provider_id = ? ORDER BY created_at DESC LIMIT 5',
     [$id]
@@ -234,6 +235,22 @@ require INCLUDES_PATH . '/admin-header.php';
         </div>
         <div class="card__body">
             <p class="small muted mb-2"><?= e($billing['summary'] ?? '') ?></p>
+
+            <?php if ($feeState['locked']): ?>
+                <!-- What the system has already done to this provider, stated
+                     before the numbers - it is the most important fact here. -->
+                <?= alert_box('danger',
+                    $feeState['detail'] . ' Collect the invoice, mark it paid, or give them more time from the Billing screen.',
+                    $feeState['stopped'] ? 'Locked, and their network has stopped selling' : 'Locked out of their account') ?>
+            <?php elseif ($feeState['warn']): ?>
+                <?= alert_box('warning', $feeState['detail'], $feeState['headline']) ?>
+            <?php endif; ?>
+
+            <?php if (!empty($feeState['grace_until'])): ?>
+                <?= alert_box('info',
+                    'Nothing will be locked before ' . format_date($feeState['grace_until'], 'd M Y') . '.',
+                    'Extension granted') ?>
+            <?php endif; ?>
             <?= key_value([
                 'Fee'          => e(money($billing['fee'] ?? 0)) . ' every ' . (($billing['cycle_months'] ?? 1) === 1 ? 'month' : ($billing['cycle_months'] ?? 1) . ' months'),
                 'Billing starts' => e(format_date($billing['starts_on'] ?? null, 'd M Y'))

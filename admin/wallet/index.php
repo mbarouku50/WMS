@@ -55,7 +55,26 @@ if (is_post()) {
     }
 
     if ($action === 'pay_invoice') {
-        $result = $billing->payFromWallet((int)post('invoice_id'));
+        /*
+         * The invoice id arrives from a form, so it has to be proved to
+         * belong to this provider. Without this a provider could post
+         * another tenant's invoice id and drain that tenant's wallet.
+         */
+        $invoiceId = (int)post('invoice_id');
+        $owns = Database::getInstance()->count(
+            'SELECT COUNT(*) FROM platform_invoices WHERE id = ? AND provider_id = ?',
+            [$invoiceId, $providerId]
+        ) > 0;
+
+        if (!$owns) {
+            Logger::warning('Blocked a cross-provider invoice payment', [
+                'invoice_id' => $invoiceId, 'acting_provider' => $providerId,
+            ]);
+            Response::back('error', 'That invoice could not be found on this account.');
+        }
+
+        $result = $billing->payFromWallet($invoiceId);
+        BillingGuard::forget($providerId);
         Response::back($result['ok'] ? 'success' : 'error', $result['message']);
     }
 
@@ -64,6 +83,7 @@ if (is_post()) {
 
 $balance  = $walletService->balance($providerId);
 $terms    = $billing->terms($providerId);
+$feeState = (new BillingGuard())->state($providerId);
 $summary  = $ledger->summary(date('Y-m-01 00:00:00'), date('Y-m-t 23:59:59'));
 $series   = $ledger->dailyEarnings(14);
 
@@ -211,6 +231,10 @@ require INCLUDES_PATH . '/admin-header.php';
             </div>
             <div class="card__body">
                 <p class="small muted mb-2"><?= e($terms['summary'] ?? '') ?></p>
+
+                <?php if ($feeState['warn']): ?>
+                    <?= alert_box($feeState['locked'] ? 'danger' : 'warning', $feeState['detail'], $feeState['headline']) ?>
+                <?php endif; ?>
                 <?= key_value([
                     'Fee'         => e(money($terms['fee'] ?? 0)) . ' every ' . (($terms['cycle_months'] ?? 1) === 1 ? 'month' : ($terms['cycle_months'] ?? 1) . ' months'),
                     'Starts on'   => e(format_date($terms['starts_on'] ?? null, 'd M Y')),
@@ -241,6 +265,10 @@ require INCLUDES_PATH . '/admin-header.php';
                                     <input type="hidden" name="invoice_id" value="<?= (int)$invoice['id'] ?>">
                                     <button class="btn btn--sm btn--primary" name="action" value="pay_invoice">Pay now</button>
                                 </form>
+                            <?php else: ?>
+                                <!-- The wallet cannot cover it, which is the normal case for a
+                                     voucher-only operator. The pay screen takes it from a phone. -->
+                                <a class="btn btn--sm btn--primary" href="<?= e(url(BillingGuard::PAY_PAGE)) ?>">Pay by phone</a>
                             <?php endif; ?>
                         </div>
                     <?php endforeach; ?>

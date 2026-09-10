@@ -284,7 +284,12 @@ mysqldump -u USER -p DBNAME > wms-backup-$(date +%F).sql
 mysql -u USER -p DBNAME < database/upgrade_multi_provider.sql
 mysql -u USER -p DBNAME < database/upgrade_provider_billing.sql
 mysql -u USER -p DBNAME < database/upgrade_network_production.sql
+mysql -u USER -p DBNAME < database/upgrade_platform_fee_enforcement.sql
+mysql -u USER -p DBNAME < database/upgrade_platform_payouts.sql
 ```
+
+Every one of them is safe to run twice, so re-running the list after an
+update costs nothing.
 
 It ends by printing a verification table — read it before you trust the run:
 
@@ -614,14 +619,141 @@ registration ──grace period──> first invoice ──7 days──> due
                                     └─ repeats every cycle
 ```
 
-Run by `cron.php`, or by hand with **Billing → Run billing now**.
-
-An overdue provider is **flagged and alerted, never switched off**. Cutting a
-business off is a decision for a person, so it stays your call — suspend them
-from the provider list if you decide to.
+Run by `cron.php`, or by hand with **Billing → Run billing now**. An invoice
+whose date has arrived is also raised the moment the provider opens their
+account, so enforcement never waits on a cron job somebody forgot to set up.
 
 A provider also cannot withdraw money they owe you: the withdrawal form
 refuses to leave the wallet short of the outstanding fee.
+
+### When the fee is not paid
+
+The fee is enforced. A provider who ignores it moves through five stages:
+
+```
+  CLEAR ─> WARNING ─> DUE SOON ─────> LOCKED ─────────> STOPPED
+           invoice    within 3 days   deadline passed   still unpaid
+           raised     of the deadline │                 │
+           │          │               │                 └─ their customers
+           │          │               │                    cannot buy or
+           │          │               │                    activate. Anyone
+           │          │               │                    already online
+           │          │               │                    stays online.
+           │          │               │
+           │          │               └─ they can sign in, but the ONLY
+           │          │                  screen they can reach is the one
+           │          │                  that takes the payment
+           │          │
+           │          └─ signing in lands them on the pay screen, with a
+           │             "Continue to my dashboard for now" way past it
+           │
+           └─ a bar on their dashboard and a notification. Nothing more:
+              an invoice raised three weeks early is not a reason to
+              interrupt a working business.
+```
+
+**Where sign-in takes them** is the whole of the difference between the
+middle stages:
+
+| Stage | Signing in lands on | Can they work? |
+|---|---|---|
+| Warning | Their dashboard | Yes |
+| Due soon | The pay screen | Yes — one tap past it |
+| Locked | The pay screen | No |
+| Stopped | The pay screen | No, and neither can their customers |
+
+Three days is `platform_fee_warn_days`. Set it to `0` and nobody is ever
+diverted before the deadline; set it to `30` and they are taken to the pay
+screen from the day the invoice is raised.
+
+### What the provider is told, and when
+
+Nobody should be locked out by a system that never spoke to them. Every
+stage rings the provider's own alert bell — the same bell in their own
+control centre, not an email they may never read:
+
+| When | What they are told |
+|---|---|
+| You set or change their terms | *Your platform fee has been set* — the amount, the cycle, and the date it starts |
+| The invoice is raised | *Your platform fee invoice is ready* — amount, period, deadline |
+| 3 days out (or fewer) | *3 days left to pay your platform fee* |
+| The deadline passes | *Your account is locked until the platform fee is paid* |
+| They pay | Every one of the above is taken down |
+
+Each notice is raised once and left alone until it is resolved, so opening
+ten pages does not produce ten reminders.
+
+**You** get your own, on your own bell: a fee falling due, a provider
+locked, a network stopped, and — the one you actually want — **Platform fee
+received from X** the moment money arrives. Where you can see every
+tenant's alerts, each one now carries the name of the provider it belongs
+to, so a notice written to *you* is never mistaken for one written to them.
+
+### Changing the terms takes back the demand
+
+If you give a provider more time — Providers → (them) → Edit → **Billing
+starts on**, moved to a later date — any unpaid invoice for a period before
+that date is **cancelled**, every reminder about it is taken down, and any
+lock is lifted. That is the point of moving the date.
+
+Paid invoices are never touched. That money has moved, and rewriting the
+accounts to match a new agreement would be a lie about them.
+
+Making a provider **Exempt** cancels every unpaid invoice they have.
+
+Setting the date to one that has **already passed** does the opposite: it
+bills them for that period now. They still get the full payment window
+(`platform_fee_due_days`, 7 by default) counted **from today**, not from the
+backdated period — an invoice raised late still has to give the provider the
+agreed time to pay it, or they would be handed a bill and locked out in the
+same instant.
+
+Changing your mind is safe in both directions. A period whose invoice was
+cancelled can be billed again if you move the date back over it.
+
+**Why they can still sign in.** Refusing the password would be simpler and
+useless — a provider who cannot sign in can never pay you. So the credentials
+work, and the account opens onto the invoice with everything else closed off.
+Every other page redirects there until it is settled.
+
+**How they pay.** Two ways, both on that screen:
+
+| | When it is used |
+|---|---|
+| **From the wallet** | Their customers' mobile money has built up enough to cover it |
+| **From their phone** | A USSD prompt straight to their handset — the normal route for a voucher-only operator, whose wallet is always empty |
+
+The second one matters. Without it, every provider selling by voucher would
+eventually be locked out with no way back in.
+
+**What releases them.** Anything that settles the invoice — they pay it, you
+collect it from their wallet, you mark it paid outside the system, or you
+waive it. There is no separate unlock to remember: the account and their
+network reopen in the same instant, and nothing has been deleted in the
+meantime.
+
+**Giving one provider more time.** **Billing → Locked over an unpaid fee →
+Release → Unlock until that date**. The debt stands; the deadlines simply do
+not apply to them until that date. It is audit logged with your name on it.
+
+**The dials**, under `settings` (billing group):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `platform_fee_enforce` | `1` | Off makes the whole thing advisory again — warnings, no locks |
+| `platform_fee_due_days` | `7` | Days between the invoice being raised and the deadline |
+| `platform_fee_lock_after_days` | `0` | Extra days past the deadline before the account locks |
+| `platform_fee_stop_service` | `1` | Whether an unpaid fee ever stops customer service |
+| `platform_fee_stop_service_after_days` | `0` | Extra days after the lock before it does |
+| `platform_fee_pay_by_mobile` | `1` | Whether a provider may settle from their phone |
+| `platform_fee_warn_days` | `3` | Days before the deadline to start reminding them and sending them to the pay screen |
+
+Set `platform_fee_due_days` to `0` if you want the lock on the billing date
+itself, with no window at all.
+
+**What is deliberately *not* done:** a customer already online on a package
+they paid for is never disconnected. The debt is the operator's, not theirs.
+Only new sales and new activations stop.
 
 ### Withdrawals
 
@@ -643,6 +775,71 @@ phone or a longer card) are validated before anything is sent.
 Set the minimum withdrawal and whether approval is required under
 **Settings → Payments**.
 
+### Taking your own money out
+
+Fees you collect land in your SonicPesa merchant account. **Billing → My
+money** is where you draw them down.
+
+```
+   provider pays their fee
+            ↓
+   your merchant account
+            ↓
+   Billing → My money → Withdraw   →   SonicPesa payout   →   your bank
+```
+
+The screen is honest about something that matters: **your merchant account
+holds two different kinds of money.**
+
+| | Whose it is |
+|---|---|
+| **Fees collected** | Yours. This is what you can withdraw. |
+| **Provider wallet balances** | Theirs. It sits in the same account, and it is what you pay them with when they withdraw. |
+
+WMS will not let you draw down the second one. *Yours to withdraw* is
+computed every time it is asked for — fees actually collected, less payouts
+already sent — rather than kept in a column that can drift from the truth.
+A payout still in flight counts against it exactly as a completed one does,
+so the same shillings cannot be sent twice while SonicPesa is still
+thinking.
+
+There is no approval step: you are the approver, so a withdrawal validates
+and sends in one movement. The record is written *before* the gateway is
+called, so a payout can never happen without a row saying it did.
+
+If SonicPesa refuses it, the attempt is recorded as **Failed** with the
+reason, and the money is available again. If it is accepted but not yet
+confirmed it sits at **Processing** until the cron poll closes it out — or
+you mark it completed yourself when you see it land.
+
+Set the smallest withdrawal with `platform_withdrawal_minimum`.
+
+### If an action ever says "That action is not supported"
+
+That message means the page received a POST with no `action` in it, or one
+it does not recognise. It is the right answer to a genuine mismatch, and it
+was for a long time the wrong answer to a perfectly good click.
+
+Two faults in `assets/js/app.js` caused it, both now fixed:
+
+**The confirm dialog dropped the button.** `form.submit()` — which is what
+the "Are you sure?" dialog calls once you say yes — does not send the button
+that submitted the form. Nearly every action in WMS rides on that button
+(`<button name="action" value="delete">`), so every confirmed action in the
+system arrived with no action at all. Deleting an alert, approving a
+withdrawal, cancelling a voucher, retiring a router: all of them. The
+submitter is now captured before the dialog opens and carried across as a
+hidden field.
+
+**Bulk actions sent no rows.** The bulk bar sits above the table, so the
+row checkboxes are not inside its form and the browser never sent them.
+Every bulk action was refused with "select at least one row first", however
+many rows were ticked. The ticked ids are now collected at the moment of
+submission.
+
+If you see the message after this, it is real: the action name in the form
+and the one in the page's `switch` genuinely disagree.
+
 ### Correcting a wallet
 
 **Billing → Adjust a wallet** credits or debits a provider by hand, with a
@@ -653,11 +850,13 @@ log with your name on it.
 
 **Provider — Wallet**: available balance, what is held, earned this month,
 fees owed, the full ledger with a running balance, their withdrawals, and
-their unpaid invoices with a *Pay now* button.
+their unpaid invoices with a *Pay now* button (or *Pay by phone* when the
+wallet cannot cover it).
 
 **You — Billing**: total held across all providers, fees collected and
-outstanding, withdrawals waiting for approval, every invoice, and every
-provider wallet side by side.
+outstanding, anyone currently locked out over an unpaid fee, withdrawals
+waiting for approval, every invoice, every provider wallet side by side —
+and, under **My money**, your own fee income and the way to withdraw it.
 
 ---
 
@@ -1186,7 +1385,9 @@ WMS/
 ├── assets/js               app.js, admin.js, customer.js
 ├── uploads/                Logos and documents (never executable)
 ├── database/               schema.sql, upgrade_multi_provider.sql,
-│                           upgrade_provider_billing.sql, seed.sql
+│                           upgrade_provider_billing.sql,
+│                           upgrade_platform_fee_enforcement.sql,
+│                           upgrade_platform_payouts.sql, seed.sql
 └── logs/                   Dated log files, not web readable
 ```
 
