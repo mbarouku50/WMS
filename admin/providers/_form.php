@@ -119,18 +119,34 @@
                                  . 'bills them now, with '
                                  . (int)setting('platform_fee_due_days', 7) . ' days from today to pay.',
                     ]) ?>
-                    <?= field_select([
-                        'name'    => 'billing_status',
-                        'label'   => 'Billing status',
-                        'value'   => (string)($values['billing_status'] ?? 'grace'),
-                        'options' => [
-                            'grace'   => 'Grace period - not charged yet',
-                            'current' => 'Current - up to date',
-                            'due'     => 'Due - invoice outstanding',
-                            'overdue' => 'Overdue',
-                            'exempt'  => 'Exempt - never charged',
-                        ],
-                    ]) ?>
+                    <?php
+                    /*
+                     * Billing status is worked out, never typed. It follows the
+                     * start date above and what is actually owed - a date in the
+                     * future is grace, an unpaid invoice is due, a missed due
+                     * date is overdue, a zero fee is exempt. Letting it be set by
+                     * hand only ever let the label disagree with the invoices.
+                     */
+                    $currentStatus = (string)($values['billing_status'] ?? 'grace');
+                    $statusLabels  = [
+                        'grace'   => 'Grace period — not charged yet',
+                        'current' => 'Current — up to date',
+                        'due'     => 'Due — invoice outstanding',
+                        'overdue' => 'Overdue',
+                        'exempt'  => 'Exempt — never charged',
+                    ];
+                    ?>
+                    <div class="field">
+                        <span class="field__label">Billing status</span>
+                        <div class="mt-1">
+                            <?= badge($currentStatus, $statusLabels[$currentStatus] ?? label($currentStatus)) ?>
+                        </div>
+                        <div class="field__hint">
+                            Set automatically from the start date and what is owed: a future start date is
+                            <b>grace</b>, an unpaid invoice is <b>due</b>, a missed due date is <b>overdue</b>,
+                            and a fee of 0 is <b>exempt</b>. Change the date or the fee above and this follows.
+                        </div>
+                    </div>
                 <?php endif; ?>
             </div>
         </fieldset>

@@ -123,6 +123,13 @@ class WalletService
             }
             $this->db->update('providers', $updates, 'id = ?', [$providerId]);
 
+            /*
+             * uq_wt_payment_type makes this insert the point where a second
+             * credit for the same sale is refused. The webhook, the browser
+             * status poll and the cron reconciliation all reach fulfil(), and
+             * two of them arriving together would otherwise both pass the
+             * "already credited?" check and both credit the wallet.
+             */
             $this->db->insert('wallet_transactions', [
                 'provider_id'   => $providerId,
                 'type'          => $type,
@@ -141,6 +148,17 @@ class WalletService
             $this->db->commit();
         } catch (Throwable $e) {
             $this->db->rollback();
+
+            // The unique index caught a duplicate: the other caller won the
+            // race and the money has already moved. Nothing has been lost.
+            if (self::isDuplicate($e)) {
+                Logger::payment('Ignored a duplicate wallet movement', [
+                    'provider_id' => $providerId, 'type' => $type,
+                    'payment_id'  => $links['payment_id'] ?? null,
+                ]);
+                return ['ok' => true, 'message' => 'That movement was already recorded.', 'duplicate' => true];
+            }
+
             Logger::error('Wallet movement failed: ' . $e->getMessage(), [
                 'provider_id' => $providerId, 'type' => $type, 'direction' => $direction,
             ]);
@@ -148,6 +166,17 @@ class WalletService
         }
 
         return ['ok' => true, 'message' => 'Wallet updated.', 'balance' => round($new, 2)];
+    }
+
+    /** True when MySQL refused a write because a unique key already held it. */
+    private static function isDuplicate(Throwable $e): bool
+    {
+        for ($error = $e; $error !== null; $error = $error->getPrevious()) {
+            if ((int)$error->getCode() === 1062 || str_contains($error->getMessage(), 'Duplicate entry')) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -222,7 +251,7 @@ class WalletService
     public function requestWithdrawal(int $providerId, array $input): array
     {
         $amount  = round((float)($input['amount'] ?? 0), 2);
-        $minimum = (float)setting('withdrawal_minimum', 5000);
+        $minimum = (float)setting('withdrawal_minimum', Withdrawal::MINIMUM);
 
         $provider = $this->db->fetchOne('SELECT * FROM providers WHERE id = ? LIMIT 1', [$providerId]);
         if (!$provider) {
@@ -235,7 +264,11 @@ class WalletService
         $balance = $this->balance($providerId);
 
         if ($amount < $minimum) {
-            return ['ok' => false, 'message' => 'The smallest withdrawal is ' . money($minimum) . '.'];
+            return [
+                'ok' => false,
+                'message' => 'The smallest withdrawal is ' . money($minimum) . '. You have '
+                    . money($balance['available']) . ' available.',
+            ];
         }
         if ($amount > $balance['available']) {
             return [
@@ -354,7 +387,20 @@ class WalletService
             return ['ok' => false, 'message' => 'SonicPesa is not configured, so no payout can be sent. Add the API key and secret under Settings → Payments.'];
         }
 
-        $this->db->update('withdrawals', ['status' => 'processing', 'approved_by' => Auth::id()], 'id = ?', [$withdrawalId]);
+        /*
+         * Claim the withdrawal before the gateway is called, in one statement
+         * that only succeeds while it is still pending. Two administrators
+         * approving the same payout at the same moment would otherwise both
+         * read "pending" and both send real money.
+         */
+        $claimed = $this->db->execute(
+            "UPDATE withdrawals SET status = 'processing', approved_by = ?
+              WHERE id = ? AND status = 'pending'",
+            [Auth::id(), $withdrawalId]
+        );
+        if ($claimed === 0) {
+            return ['ok' => false, 'message' => 'Someone else is already sending that withdrawal.'];
+        }
 
         $result = $provider->createPayout(
             (float)$withdrawal['amount'],
@@ -368,9 +414,11 @@ class WalletService
             return ['ok' => false, 'message' => 'The payout was refused: ' . $result['message']];
         }
 
-        $data = $result['data'] ?? [];
+        $data      = $result['data'] ?? [];
+        $payoutRef = isset($data['withdrawal_id']) ? trim((string)$data['withdrawal_id']) : '';
+
         $this->db->update('withdrawals', [
-            'provider_ref' => isset($data['withdrawal_id']) ? (string)$data['withdrawal_id'] : null,
+            'provider_ref' => $payoutRef !== '' ? $payoutRef : null,
             'fee'          => (float)($data['fee'] ?? 0),
             'net_amount'   => (float)($data['net_amount'] ?? $withdrawal['amount']),
             'raw_response' => mb_substr(json_encode($result['data']) ?: '', 0, 8000),
@@ -378,6 +426,24 @@ class WalletService
 
         AuditLog::record('withdrawal_sent', 'withdrawal', $withdrawalId,
             'Sent ' . money((float)$withdrawal['amount']) . ' to ' . $withdrawal['method']);
+
+        /*
+         * Without a reference there is nothing to poll: reconcileWithdrawals()
+         * only looks at rows that have one. The payout would sit in
+         * "processing" for ever with the provider's money held, and nobody
+         * would be told. Say so loudly instead.
+         */
+        if ($payoutRef === '') {
+            Logger::error('SonicPesa accepted a payout but returned no withdrawal_id', [
+                'withdrawal_id' => $withdrawalId, 'reference' => $withdrawal['reference'],
+            ]);
+            Alert::raise('withdrawal_unreferenced', 'warning',
+                'A payout was sent without a SonicPesa reference',
+                'Withdrawal ' . $withdrawal['reference'] . ' for ' . money((float)$withdrawal['amount'])
+                . ' was accepted, but SonicPesa returned no withdrawal id, so WMS cannot poll it. '
+                . 'Check the payout in the SonicPesa dashboard and close this withdrawal by hand.',
+                'withdrawal', $withdrawalId);
+        }
 
         // SonicPesa reports "pending" until it settles; the webhook or the
         // cron poll finishes the job.
@@ -389,12 +455,30 @@ class WalletService
         return ['ok' => true, 'message' => 'Payout sent. It will complete once SonicPesa confirms it.'];
     }
 
-    /** The payout landed: turn the hold into a real debit. */
+    /**
+     * The payout landed: turn the hold into a real debit.
+     *
+     * Reached from two directions at once - SonicPesa's payout.success
+     * webhook and the cron reconciliation - so the row is claimed first, in
+     * one statement. Whoever loses that race does nothing, instead of
+     * releasing the hold and debiting the wallet a second time.
+     */
     public function completeWithdrawal(int $withdrawalId): array
     {
         $withdrawal = $this->db->fetchOne('SELECT * FROM withdrawals WHERE id = ? LIMIT 1', [$withdrawalId]);
-        if (!$withdrawal || $withdrawal['status'] === 'completed') {
-            return ['ok' => true, 'message' => 'Already completed.'];
+        if (!$withdrawal) {
+            return ['ok' => false, 'message' => 'That withdrawal could not be found.'];
+        }
+
+        $wasStatus = (string)$withdrawal['status'];
+
+        $claimed = $this->db->execute(
+            "UPDATE withdrawals SET status = 'completed', completed_at = ?
+              WHERE id = ? AND status IN ('pending','processing')",
+            [date('Y-m-d H:i:s'), $withdrawalId]
+        );
+        if ($claimed === 0) {
+            return ['ok' => true, 'message' => 'That withdrawal is already closed.'];
         }
 
         $providerId = (int)$withdrawal['provider_id'];
@@ -411,15 +495,19 @@ class WalletService
             ['reference' => $withdrawal['reference'], 'withdrawal_id' => $withdrawalId, 'created_by' => null]);
 
         if (!$result['ok']) {
-            // Put the hold back rather than losing track of the money.
+            // Put the hold and the status back rather than losing track of
+            // the money: the payout is still in flight as far as WMS knows.
             $this->db->execute('UPDATE providers SET wallet_held = wallet_held + ? WHERE id = ?', [$amount, $providerId]);
+            $this->db->update('withdrawals', ['status' => $wasStatus, 'completed_at' => null], 'id = ?', [$withdrawalId]);
+
+            Alert::raise('withdrawal_debit_failed', 'danger',
+                'A completed payout could not be debited',
+                'Withdrawal ' . $withdrawal['reference'] . ' for ' . money($amount) . ' was paid out by SonicPesa '
+                . 'but the wallet could not be debited: ' . $result['message'] . ' Please correct it manually.',
+                'withdrawal', $withdrawalId);
+
             return $result;
         }
-
-        $this->db->update('withdrawals', [
-            'status'       => 'completed',
-            'completed_at' => date('Y-m-d H:i:s'),
-        ], 'id = ?', [$withdrawalId]);
 
         AuditLog::record('withdrawal_complete', 'withdrawal', $withdrawalId,
             'Withdrawal ' . $withdrawal['reference'] . ' completed (' . money($amount) . ')');
@@ -438,7 +526,20 @@ class WalletService
         if (!$withdrawal) {
             return ['ok' => false, 'message' => 'That withdrawal could not be found.'];
         }
-        if (in_array($withdrawal['status'], ['completed', 'failed', 'cancelled'], true)) {
+
+        /*
+         * Close the row first, and only release the hold if this call is the
+         * one that closed it. A failure webhook and the cron reconciliation
+         * can both arrive; releasing twice would free money still held
+         * against a different pending withdrawal.
+         */
+        $status  = in_array($status, ['failed', 'cancelled'], true) ? $status : 'cancelled';
+        $claimed = $this->db->execute(
+            "UPDATE withdrawals SET status = ?, failure_reason = ?
+              WHERE id = ? AND status IN ('pending','processing')",
+            [$status, mb_substr($reason, 0, 255) ?: null, $withdrawalId]
+        );
+        if ($claimed === 0) {
             return ['ok' => true, 'message' => 'That withdrawal is already closed.'];
         }
 
@@ -446,10 +547,6 @@ class WalletService
             'UPDATE providers SET wallet_held = GREATEST(0, wallet_held - ?) WHERE id = ?',
             [(float)$withdrawal['amount'], (int)$withdrawal['provider_id']]
         );
-        $this->db->update('withdrawals', [
-            'status'         => in_array($status, ['failed', 'cancelled'], true) ? $status : 'cancelled',
-            'failure_reason' => mb_substr($reason, 0, 255) ?: null,
-        ], 'id = ?', [$withdrawalId]);
 
         AuditLog::record('withdrawal_' . $status, 'withdrawal', $withdrawalId,
             'Withdrawal ' . $withdrawal['reference'] . ' ' . $status . '. ' . $reason);
@@ -477,7 +574,7 @@ class WalletService
 
         foreach ((new Withdrawal())->inFlight($limit) as $withdrawal) {
             $checked++;
-            $result = $provider->payoutStatus((int)$withdrawal['provider_ref']);
+            $result = $provider->payoutStatus((string)$withdrawal['provider_ref']);
             if (!$result['ok']) {
                 continue;
             }

@@ -140,6 +140,7 @@ $pendingPayouts = $withdrawals->pendingApproval(20);
 $providerList   = $providers->listAll();
 $lockedProviders = $invoices->lockedProviders();
 $myBalance       = $platform->balance();
+$myMinimum       = (float)setting('platform_withdrawal_minimum', Withdrawal::MINIMUM);
 
 $pageTitle    = 'Billing';
 $pageSubtitle = 'Provider wallets, platform fees and payouts';
@@ -415,63 +416,121 @@ require INCLUDES_PATH . '/admin-header.php';
                 </div>
             </div>
             <div class="card__body">
-                <?php if ($myBalance['available'] < (float)setting('platform_withdrawal_minimum', 5000)): ?>
-                    <?= empty_state([
-                        'icon'  => 'money',
-                        'title' => 'Nothing to withdraw yet',
-                        'text'  => 'You have ' . money($myBalance['available']) . ' in collected fees. The smallest '
-                                 . 'withdrawal is ' . money((float)setting('platform_withdrawal_minimum', 5000)) . '.',
-                    ]) ?>
-                <?php else: ?>
-                    <form method="post" action=""
-                          data-confirm="Send this money to your own account? This moves real money."
-                          data-confirm-tone="primary" data-confirm-button="Send it">
-                        <?= CSRF::field() ?>
-                        <input type="hidden" name="action" value="platform_withdraw">
+                <?php
+                /*
+                 * The form is always here, whatever the balance. Hiding it
+                 * left the owner with no way to see where they withdraw or
+                 * what it would ask for. What the balance changes is what
+                 * the form says, never whether it exists.
+                 */
+                $myEnough = $myBalance['available'] >= $myMinimum;
+                ?>
+                <p class="small muted mt-0">
+                    Ready to withdraw: <b><?= e(money($myBalance['available'])) ?></b> of collected fees.
+                    The smallest withdrawal is <b><?= e(money($myMinimum)) ?></b>.
+                </p>
 
-                        <?= field_input([
-                            'name'     => 'amount',
-                            'type'     => 'number',
-                            'label'    => 'Amount',
-                            'required' => true,
-                            'value'    => (string)$myBalance['available'],
-                            'hint'     => 'Up to ' . money($myBalance['available']) . '.',
-                            'attrs'    => 'min="' . (float)setting('platform_withdrawal_minimum', 5000)
-                                        . '" max="' . $myBalance['available'] . '" step="1"',
-                        ]) ?>
-
-                        <?= field_select([
-                            'name'     => 'method',
-                            'label'    => 'Send it to',
-                            'required' => true,
-                            'options'  => Withdrawal::METHODS,
-                        ]) ?>
-
-                        <?= field_input([
-                            'name'        => 'account_number',
-                            'label'       => 'Account or phone number',
-                            'required'    => true,
-                            'placeholder' => '0712 345 678',
-                        ]) ?>
-
-                        <?= field_input([
-                            'name'        => 'account_name',
-                            'label'       => 'Name on the account',
-                            'required'    => true,
-                            'placeholder' => 'As registered with the bank or wallet',
-                        ]) ?>
-
-                        <?= field_input([
-                            'name'        => 'note',
-                            'label'       => 'Note (optional)',
-                            'placeholder' => 'What this withdrawal was for',
-                        ]) ?>
-
-                        <button class="btn btn--primary btn--block" type="submit">
-                            <?= icon('download', 'ico--sm') ?> Withdraw
-                        </button>
-                    </form>
+                <?php if (!$myEnough): ?>
+                    <?= alert_box('info',
+                        'You have ' . money($myBalance['available']) . ' in collected fees. The smallest withdrawal is '
+                        . money($myMinimum) . ', so there is ' . money($myMinimum - $myBalance['available'])
+                        . ' to go before you can send it. The form below is ready for when you get there.',
+                        'Not enough to send yet') ?>
                 <?php endif; ?>
+
+                <form method="post" action=""
+                      data-confirm="Send this money to your own account? This moves real money."
+                      data-confirm-tone="primary" data-confirm-button="Send it">
+                    <?= CSRF::field() ?>
+                    <input type="hidden" name="action" value="platform_withdraw">
+
+                    <?= field_input([
+                        'name'     => 'amount',
+                        'type'     => 'number',
+                        'label'    => 'How much do you want to withdraw?',
+                        'required' => true,
+                        'value'    => $myEnough ? (string)$myBalance['available'] : '',
+                        'hint'     => 'Between ' . money($myMinimum) . ' and ' . money($myBalance['available']) . '.',
+                        // No max under the min: that input could never be satisfied.
+                        'attrs'    => 'min="' . $myMinimum . '"'
+                                    . ($myEnough ? ' max="' . $myBalance['available'] . '"' : '')
+                                    . ' step="1" data-withdraw-amount',
+                    ]) ?>
+
+                    <p class="small" id="withdraw-check" data-minimum="<?= e((string)$myMinimum) ?>"
+                       data-ceiling="<?= e((string)$myBalance['available']) ?>" style="min-height:1.2em"></p>
+
+                    <?= field_select([
+                        'name'     => 'method',
+                        'label'    => 'Send it to',
+                        'required' => true,
+                        'options'  => Withdrawal::METHODS,
+                    ]) ?>
+
+                    <?= field_input([
+                        'name'        => 'account_number',
+                        'label'       => 'Phone or account number to send it to',
+                        'required'    => true,
+                        'class'       => 'input--mono',
+                        'placeholder' => '0712 345 678',
+                        'hint'        => 'The mobile money number that will receive the money, or the bank account number.',
+                    ]) ?>
+
+                    <?= field_input([
+                        'name'        => 'account_name',
+                        'label'       => 'Name on the account',
+                        'required'    => true,
+                        'placeholder' => 'As registered with the bank or wallet',
+                    ]) ?>
+
+                    <?= field_input([
+                        'name'        => 'note',
+                        'label'       => 'Note (optional)',
+                        'placeholder' => 'What this withdrawal was for',
+                    ]) ?>
+
+                    <button class="btn btn--primary btn--block" type="submit">
+                        <?= icon('download', 'ico--sm') ?> Withdraw
+                    </button>
+                </form>
+
+                <script>
+                /* Same live check as the provider wallet: says where you
+                   stand as you type. The server is still the real gate. */
+                (function () {
+                    var note = document.getElementById('withdraw-check');
+                    var box  = document.querySelector('[data-withdraw-amount]');
+                    if (!note || !box) { return; }
+
+                    var minimum  = parseFloat(note.dataset.minimum) || 0;
+                    var ceiling  = parseFloat(note.dataset.ceiling) || 0;
+                    var currency = <?= json_encode((string)setting('currency', 'TSh')) ?>;
+
+                    function money(value) {
+                        return currency + ' ' + Math.round(value).toLocaleString('en-US');
+                    }
+
+                    function check() {
+                        var value = parseFloat(box.value);
+                        if (box.value === '' || isNaN(value)) { note.textContent = ''; return; }
+
+                        if (value < minimum) {
+                            note.style.color = 'var(--wms-warning)';
+                            note.textContent = 'Too small. The smallest withdrawal is ' + money(minimum)
+                                             + ' — add ' + money(minimum - value) + ' more.';
+                        } else if (value > ceiling) {
+                            note.style.color = 'var(--wms-danger)';
+                            note.textContent = 'That is more than you have. You can send up to ' + money(ceiling) + '.';
+                        } else {
+                            note.style.color = 'var(--wms-success)';
+                            note.textContent = money(value) + ' can be sent.';
+                        }
+                    }
+
+                    box.addEventListener('input', check);
+                    check();
+                })();
+                </script>
             </div>
         </section>
 

@@ -258,6 +258,130 @@ class Provider extends Model
         $this->updateById($id, ['status' => $status]);
     }
 
+    /* ================================================================= */
+    /* Deleting a tenant                                                 */
+    /* ================================================================= */
+
+    /**
+     * What would be destroyed with this provider, and anything that says it
+     * should not be. Shown to the Super Admin before they confirm.
+     *
+     * @return array{counts:array<string,int>,blockers:array<int,string>,wallet:float,held:float}
+     */
+    public function deletionImpact(int $providerId): array
+    {
+        $count = fn(string $table): int => $this->db->count(
+            'SELECT COUNT(*) FROM `' . $table . '` WHERE provider_id = ?', [$providerId]
+        );
+
+        $counts = [
+            'staff users'   => $count('users'),
+            'customers'     => $count('customers'),
+            'packages'      => $count('packages'),
+            'vouchers'      => $count('vouchers'),
+            'payments'      => $count('payments'),
+            'routers'       => $count('routers'),
+            'sessions'      => $count('sessions'),
+            'wallet entries'=> $count('wallet_transactions'),
+            'invoices'      => $count('platform_invoices'),
+        ];
+
+        $provider = $this->db->fetchOne(
+            'SELECT wallet_balance, wallet_held FROM providers WHERE id = ? LIMIT 1', [$providerId]
+        ) ?? [];
+        $balance = (float)($provider['wallet_balance'] ?? 0);
+        $held    = (float)($provider['wallet_held'] ?? 0);
+
+        /*
+         * Money is the one thing deleting cannot undo. A wallet with a
+         * balance is money this platform owes a real business, and a payout
+         * still in flight is money already moving at SonicPesa - deleting
+         * the row it belongs to would leave nothing to reconcile it against.
+         */
+        $blockers = [];
+        if ($balance > 0) {
+            $blockers[] = 'Their wallet still holds ' . money($balance)
+                . '. Pay it out, or adjust it to zero, before deleting them.';
+        }
+        $inFlight = $this->db->count(
+            "SELECT COUNT(*) FROM withdrawals WHERE provider_id = ? AND status IN ('pending','processing')",
+            [$providerId]
+        );
+        if ($inFlight > 0) {
+            $blockers[] = $inFlight . ' withdrawal' . ($inFlight === 1 ? ' is' : 's are')
+                . ' still in progress' . ($held > 0 ? ' (' . money($held) . ' held)' : '')
+                . '. Let them finish or cancel them first.';
+        }
+
+        return ['counts' => $counts, 'blockers' => $blockers, 'wallet' => $balance, 'held' => $held];
+    }
+
+    /**
+     * Deletes a provider and everything belonging to it.
+     *
+     * Most tenant tables cascade from the foreign key, but three things do
+     * not and have to be dealt with here:
+     *
+     *   users        - the key is ON DELETE SET NULL, and a NULL provider_id
+     *                  is how ProviderContext spells "platform scope". Left
+     *                  alone, deleting a tenant would promote its staff into
+     *                  administrators of the whole platform.
+     *   settings,
+     *   notifications,
+     *   transactions - no foreign key at all, so their rows would simply be
+     *                  orphaned against an id that no longer exists.
+     *
+     * @return array{ok:bool,message:string}
+     */
+    public function deleteProvider(int $providerId, bool $force = false): array
+    {
+        $provider = $this->find($providerId);
+        if (!$provider) {
+            return ['ok' => false, 'message' => 'That provider could not be found.'];
+        }
+
+        $impact = $this->deletionImpact($providerId);
+        if ($impact['blockers'] && !$force) {
+            return ['ok' => false, 'message' => implode(' ', $impact['blockers'])];
+        }
+
+        $name = (string)$provider['business_name'];
+        $code = (string)$provider['provider_code'];
+
+        $this->db->beginTransaction();
+        try {
+            // Staff first, for the reason above.
+            $this->db->execute('DELETE FROM users WHERE provider_id = ?', [$providerId]);
+
+            // Then the tables the schema does not cascade for us.
+            foreach (['settings', 'notifications', 'transactions'] as $table) {
+                $this->db->execute('DELETE FROM `' . $table . '` WHERE provider_id = ?', [$providerId]);
+            }
+
+            // The provider row itself; the foreign keys take the rest.
+            $this->db->execute('DELETE FROM providers WHERE id = ?', [$providerId]);
+
+            $this->db->commit();
+        } catch (Throwable $e) {
+            $this->db->rollback();
+            Logger::error('Provider deletion failed: ' . $e->getMessage(), ['provider_id' => $providerId]);
+            return ['ok' => false, 'message' => 'That provider could not be deleted. The technical detail is in the log.'];
+        }
+
+        Setting::flush();
+
+        // The audit row outlives the tenant: audit_logs.provider_id is set to
+        // NULL by the schema, so this is written against the platform.
+        AuditLog::record('provider_delete', 'provider', null,
+            'Deleted provider "' . $name . '" (' . $code . ') and all of its data');
+
+        Logger::warning('A provider was deleted', [
+            'provider_code' => $code, 'business_name' => $name, 'by_user' => Auth::id(),
+        ]);
+
+        return ['ok' => true, 'message' => $name . ' and all of its data have been deleted.'];
+    }
+
     public function counts(): array
     {
         return [

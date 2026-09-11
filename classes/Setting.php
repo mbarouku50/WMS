@@ -51,7 +51,7 @@ class Setting
         'sonicpesa_base_url', 'sonicpesa_use_simple', 'sonicpesa_buyer_email',
         'platform_fee_default', 'platform_fee_cycle_months', 'platform_fee_grace_months',
         'platform_fee_due_days', 'withdrawal_minimum', 'withdrawal_requires_approval',
-        'auto_charge_fee_from_wallet',
+        'platform_withdrawal_minimum', 'auto_charge_fee_from_wallet',
     ];
 
     /* ------------------------------------------------------------ loading */
@@ -264,5 +264,7 @@ class Setting
         'portal_ssid'         => 'WMS-Hotspot',
         'payment_provider'    => 'demo',
         'sonicpesa_base_url'  => 'https://api.sonicpesa.com/api/v1',
+        'withdrawal_minimum'          => 30000,
+        'platform_withdrawal_minimum' => 30000,
     ];
 }

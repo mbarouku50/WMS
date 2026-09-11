@@ -178,9 +178,22 @@ class SonicPesaProvider implements PaymentProvider
         ];
     }
 
-    public function payoutStatus(int $withdrawalId): array
+    /**
+     * Reads the state of one payout.
+     *
+     * The reference is whatever SonicPesa handed back at creation and is
+     * stored as text, so it is passed through as text: forcing it to an
+     * integer turned any non-numeric id into 0 and left the withdrawal
+     * stuck in "processing" with the provider's money held for ever.
+     */
+    public function payoutStatus(string $withdrawalId): array
     {
-        $response = $this->request('/payouts/status/' . $withdrawalId, null, true, 'GET');
+        $reference = trim($withdrawalId);
+        if ($reference === '') {
+            return ['ok' => false, 'message' => 'That payout has no SonicPesa reference to check.', 'data' => []];
+        }
+
+        $response = $this->request('/payouts/status/' . rawurlencode($reference), null, true, 'GET');
         return [
             'ok'      => $response['ok'],
             'message' => $response['message'],

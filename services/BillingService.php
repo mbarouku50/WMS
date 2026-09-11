@@ -68,8 +68,21 @@ class BillingService
             'billing_next_due_on'       => $startsOn,
         ];
 
+        /*
+         * Billing status is derived, not chosen. The provider form no longer
+         * offers it, because a hand-set label could disagree with the dates
+         * and the invoices - saying "current" while an invoice sat overdue.
+         *
+         * A fee of nothing means there is nothing to charge, so the provider
+         * is exempt; a start date still ahead is grace; otherwise they are
+         * current, and refreshStatus() below moves them to due or overdue if
+         * an invoice actually says so. An explicit status is still honoured
+         * for callers that have one (the installer, seeding, the API).
+         */
         if ($status !== null && in_array($status, ['grace', 'current', 'due', 'overdue', 'exempt'], true)) {
             $data['billing_status'] = $status;
+        } elseif ($fee <= 0) {
+            $data['billing_status'] = 'exempt';
         } else {
             $data['billing_status'] = $startsOn > date('Y-m-d') ? 'grace' : 'current';
         }
@@ -436,19 +449,34 @@ class BillingService
             ];
         }
 
+        /*
+         * Mark it paid first, in one statement that only succeeds while it is
+         * still unpaid. The provider's "Pay now" button and the cron auto-
+         * collection both land here, and a check followed by a separate write
+         * would let both of them debit the wallet for the same invoice.
+         */
+        $claimed = $this->db->execute(
+            "UPDATE platform_invoices SET status = 'paid', paid_at = ?, paid_from = 'wallet'
+              WHERE id = ? AND status = 'unpaid'",
+            [date('Y-m-d H:i:s'), $invoiceId]
+        );
+        if ($claimed === 0) {
+            return ['ok' => true, 'message' => 'That invoice has already been settled.'];
+        }
+
         $result = $this->wallet->debit($providerId, $amount, 'platform_fee',
             'Platform fee · ' . $invoice['invoice_number'],
             ['reference' => $invoice['invoice_number'], 'invoice_id' => $invoiceId, 'created_by' => null]);
 
         if (!$result['ok']) {
+            // Nothing was taken, so the invoice is owed again.
+            $this->db->update('platform_invoices', [
+                'status'    => 'unpaid',
+                'paid_at'   => null,
+                'paid_from' => null,
+            ], 'id = ?', [$invoiceId]);
             return $result;
         }
-
-        $this->db->update('platform_invoices', [
-            'status'    => 'paid',
-            'paid_at'   => date('Y-m-d H:i:s'),
-            'paid_from' => 'wallet',
-        ], 'id = ?', [$invoiceId]);
 
         $this->refreshStatus($providerId);
         $this->announcePayment($providerId, $invoice, $amount, 'their wallet');

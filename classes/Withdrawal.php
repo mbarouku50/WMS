@@ -13,6 +13,14 @@ class Withdrawal extends Model
     protected array $searchable = ['reference', 'account_name', 'account_number', 'provider_ref'];
     protected array $sortable = ['id', 'amount', 'status', 'created_at'];
 
+    /**
+     * The floor for any payout, provider or platform, in shillings.
+     *
+     * Settings `withdrawal_minimum` and `platform_withdrawal_minimum`
+     * override it; this is what applies when neither has been set.
+     */
+    public const MINIMUM = 30000;
+
     public const STATUSES = [
         'pending'    => 'Pending',
         'processing' => 'Processing',

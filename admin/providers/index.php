@@ -195,6 +195,9 @@ require INCLUDES_PATH . '/admin-header.php';
                                             <button class="dropdown__item" name="action" value="activate"><?= icon('check', 'ico--sm') ?> Activate</button>
                                         </form>
                                     <?php endif; ?>
+                                    <?php /* Deleting asks for the provider code, so it happens on the
+                                             overview page rather than behind a single click here. */ ?>
+                                    <a class="dropdown__item dropdown__item--danger" href="<?= e(url('admin/providers/view.php?id=' . (int)$provider['id'] . '#danger')) ?>"><?= icon('trash', 'ico--sm') ?> Delete&hellip;</a>
                                 </div>
                             </div>
                         </td>

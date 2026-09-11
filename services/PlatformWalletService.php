@@ -100,11 +100,15 @@ class PlatformWalletService
     public function withdraw(array $input): array
     {
         $amount  = round((float)($input['amount'] ?? 0), 2);
-        $minimum = (float)setting('platform_withdrawal_minimum', 5000);
+        $minimum = (float)setting('platform_withdrawal_minimum', Withdrawal::MINIMUM);
         $balance = $this->balance();
 
         if ($amount < $minimum) {
-            return ['ok' => false, 'message' => 'The smallest withdrawal is ' . money($minimum) . '.'];
+            return [
+                'ok' => false,
+                'message' => 'The smallest withdrawal is ' . money($minimum) . '. You have '
+                    . money($balance['available']) . ' in collected fees.',
+            ];
         }
         if ($amount > $balance['available']) {
             return [
@@ -176,13 +180,28 @@ class PlatformWalletService
             return ['ok' => false, 'message' => 'The payout was refused: ' . $result['message']];
         }
 
-        $data = $result['data'] ?? [];
+        $data      = $result['data'] ?? [];
+        $payoutRef = isset($data['withdrawal_id']) ? trim((string)$data['withdrawal_id']) : '';
+
         $this->db->update('platform_withdrawals', [
-            'provider_ref' => isset($data['withdrawal_id']) ? (string)$data['withdrawal_id'] : null,
+            'provider_ref' => $payoutRef !== '' ? $payoutRef : null,
             'fee'          => (float)($data['fee'] ?? 0),
             'net_amount'   => (float)($data['net_amount'] ?? $amount),
             'raw_response' => mb_substr(json_encode($data) ?: '', 0, 8000),
         ], 'id = ?', [$payoutId]);
+
+        // Nothing to poll without a reference - see WalletService for why
+        // this has to be said out loud rather than left in "processing".
+        if ($payoutRef === '') {
+            Logger::error('SonicPesa accepted a platform payout but returned no withdrawal_id', [
+                'payout_id' => $payoutId, 'reference' => $reference,
+            ]);
+            Alert::raiseFor(null, 'platform_payout_unreferenced', 'warning',
+                'A payout was sent without a SonicPesa reference',
+                'Payout ' . $reference . ' for ' . money($amount) . ' was accepted, but SonicPesa returned no '
+                . 'withdrawal id, so WMS cannot poll it. Check it in the SonicPesa dashboard and close it by hand.',
+                'platform_withdrawal', $payoutId);
+        }
 
         AuditLog::record('platform_payout', 'platform_withdrawal', $payoutId,
             'Withdrew ' . money($amount) . ' of platform fees to ' . $method . ' ' . $account . ' (' . $name . ')');
@@ -268,7 +287,7 @@ class PlatformWalletService
         foreach ($this->payouts->inFlight($limit) as $payout) {
             $checked++;
             try {
-                $status = $gateway->payoutStatus((int)$payout['provider_ref']);
+                $status = $gateway->payoutStatus((string)$payout['provider_ref']);
                 if (!$status['ok']) {
                     continue;   // unreachable this run; try again next time
                 }

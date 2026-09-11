@@ -264,6 +264,7 @@ if (is_post() && !$alreadyInstalled) {
                         'upgrade_network_production.sql',    // live router monitoring
                         'upgrade_platform_fee_enforcement.sql', // locking an unpaid provider out
                         'upgrade_platform_payouts.sql',      // the platform's own withdrawals
+                        'upgrade_wallet_integrity.sql',      // one credit per sale, enforced by the database
                     ] as $upgradeFile) {
                         $upgrade = DATABASE_PATH . '/' . $upgradeFile;
                         if (is_readable($upgrade)) {

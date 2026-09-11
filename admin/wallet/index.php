@@ -91,8 +91,37 @@ $filters  = ['q' => query('q'), 'type' => query('type'), 'date_from' => query('f
 $entries  = $ledger->search($filters, current_page(), 20);
 $myPayouts = $withdrawals->search([], 1, 10);
 
-$minimum  = (float)setting('withdrawal_minimum', 5000);
+$minimum  = (float)setting('withdrawal_minimum', Withdrawal::MINIMUM);
 $needsApproval = (string)setting('withdrawal_requires_approval', '1') === '1';
+
+/*
+ * The most that can actually be asked for. Unpaid platform fees have to be
+ * left behind, so the ceiling is not simply the available balance. Working
+ * it out here keeps the form and WalletService's own rules saying the same
+ * thing.
+ *
+ * The withdraw form is always offered, whatever the balance: a provider has
+ * to be able to see where they withdraw and what it will ask them for long
+ * before they have enough to use it. What changes with the balance is what
+ * the form tells them - never whether it is there.
+ */
+$outstanding = (float)($terms['outstanding'] ?? 0);
+$ceiling     = max(0, round($balance['available'] - $outstanding, 2));
+$mayWithdraw = Permission::has('request_withdrawal');
+$enoughToday = $ceiling >= $minimum;
+
+// Said in the provider's own terms, in the form and on the card.
+$shortfall     = max(0, round($minimum - $ceiling, 2));
+$blockedReason = '';
+if ($mayWithdraw && !$enoughToday) {
+    $blockedReason = $outstanding > 0 && $balance['available'] >= $minimum
+        ? 'You have ' . money($balance['available']) . ' available, but ' . money($outstanding)
+          . ' of it has to stay in the wallet for unpaid platform fees. That leaves ' . money($ceiling)
+          . ' to withdraw, and the smallest withdrawal is ' . money($minimum)
+          . '. Settle the invoice to free the rest up.'
+        : 'You have ' . money($ceiling) . ' ready to withdraw. The smallest withdrawal is '
+          . money($minimum) . ', so there is ' . money($shortfall) . ' to go before you can send it.';
+}
 
 $pageTitle    = 'Wallet';
 $pageSubtitle = 'What you have earned, and getting it out';
@@ -102,8 +131,9 @@ require INCLUDES_PATH . '/admin-header.php';
 ?>
 
 <?= page_head('Wallet', ProviderContext::scopeLabel(),
-    (Permission::has('request_withdrawal') && $balance['available'] >= $minimum
-        ? '<button class="btn btn--primary" data-modal-open="withdraw-form">' . icon('download', 'ico--sm') . ' Withdraw money</button>'
+    ($mayWithdraw
+        ? '<button class="btn ' . ($enoughToday ? 'btn--primary' : '') . '" data-modal-open="withdraw-form">'
+          . icon('download', 'ico--sm') . ' Withdraw money</button>'
         : '')
 ) ?>
 
@@ -280,15 +310,22 @@ require INCLUDES_PATH . '/admin-header.php';
         <section class="card">
             <div class="card__head">
                 <h2 class="card__title"><?= icon('download') ?> Withdrawals</h2>
-                <?php if (Permission::has('request_withdrawal')): ?>
-                    <button class="btn btn--sm btn--primary" data-modal-open="withdraw-form">New</button>
+                <?php if ($mayWithdraw): ?>
+                    <button class="btn btn--sm <?= $enoughToday ? 'btn--primary' : '' ?>" data-modal-open="withdraw-form">
+                        <?= $enoughToday ? 'Withdraw' : 'Withdraw…' ?>
+                    </button>
                 <?php endif; ?>
             </div>
             <div class="card__body--flush">
+                <?php if ($blockedReason !== ''): ?>
+                    <div class="card__body">
+                        <?= alert_box('info', $blockedReason, 'Not enough to withdraw yet') ?>
+                    </div>
+                <?php endif; ?>
                 <?php if (!$myPayouts['rows']): ?>
                     <?= empty_state([
                         'icon' => 'download', 'title' => 'No withdrawals yet',
-                        'text' => 'Once you have ' . money($minimum) . ' available you can send it to your bank or mobile wallet.',
+                        'text' => 'Once ' . money($minimum) . ' is free in the wallet you can send it to your bank or mobile wallet.',
                     ]) ?>
                 <?php else: ?>
                     <ul class="activity-list">
@@ -325,27 +362,39 @@ require INCLUDES_PATH . '/admin-header.php';
 
 <?php
 /* ------------------------------------------------ withdrawal dialogue -- */
-if (Permission::has('request_withdrawal')):
+if ($mayWithdraw):
     ob_start();
     echo CSRF::field();
     echo '<input type="hidden" name="action" value="withdraw">';
     ?>
     <p class="small muted">
-        Available to withdraw: <b><?= e(money($balance['available'])) ?></b>.
-        Smallest withdrawal <?= e(money($minimum)) ?>.
+        Ready to withdraw: <b><?= e(money($ceiling)) ?></b>.
+        The smallest withdrawal is <b><?= e(money($minimum)) ?></b>.
         <?= $needsApproval ? 'The platform reviews each request before the money is sent.' : 'Payouts are sent as soon as you confirm.' ?>
     </p>
 
-    <?php if (($terms['outstanding'] ?? 0) > 0): ?>
-        <?= alert_box('warning', 'You owe ' . money($terms['outstanding']) . ' in platform fees. Leave at least that much in the wallet, or settle the invoice first.') ?>
+    <?php if ($outstanding > 0): ?>
+        <?= alert_box('warning', 'You owe ' . money($outstanding) . ' in platform fees, so that much has to stay in the wallet. '
+            . 'Of your ' . money($balance['available']) . ' available, ' . money($ceiling) . ' can be withdrawn.') ?>
+    <?php endif; ?>
+
+    <?php if (!$enoughToday): ?>
+        <?= alert_box('info', $blockedReason, 'Not enough to send yet') ?>
     <?php endif; ?>
 
     <?= field_input([
-        'name' => 'amount', 'type' => 'number', 'label' => 'Amount', 'required' => true,
+        'name' => 'amount', 'type' => 'number', 'label' => 'How much do you want to withdraw?', 'required' => true,
         'prefix' => setting('currency', 'TSh'),
-        'attrs' => 'min="' . $minimum . '" max="' . $balance['available'] . '" step="any"',
-        'value' => (string)max(0, $balance['available'] - ($terms['outstanding'] ?? 0)),
+        // No max below the minimum: an input whose max is under its min can
+        // never be satisfied, and the server is the real gate either way.
+        'attrs' => 'min="' . $minimum . '"' . ($enoughToday ? ' max="' . $ceiling . '"' : '')
+                 . ' step="any" data-withdraw-amount',
+        'hint'  => 'Between ' . money($minimum) . ' and ' . money($ceiling) . '.',
+        'value' => $enoughToday ? (string)$ceiling : '',
     ]) ?>
+
+    <p class="small" id="withdraw-check" data-minimum="<?= e((string)$minimum) ?>"
+       data-ceiling="<?= e((string)$ceiling) ?>" style="min-height:1.2em"></p>
     <?= field_select([
         'name' => 'method', 'label' => 'Send to', 'required' => true,
         'value' => (string)($provider['payout_method'] ?? ''),
@@ -353,10 +402,12 @@ if (Permission::has('request_withdrawal')):
         'options' => Withdrawal::METHODS,
     ]) ?>
     <?= field_input([
-        'name' => 'account_number', 'label' => 'Account or phone number', 'required' => true,
+        'name' => 'account_number', 'label' => 'Phone or account number to send it to', 'required' => true,
         'value' => (string)($provider['payout_account_number'] ?? ''),
         'class' => 'input--mono',
-        'hint'  => 'For Selcom, use 9 digits without a leading 0 or 255.',
+        'placeholder' => '0754 000 000',
+        'hint'  => 'The mobile money number that will receive the money. For a bank, the account number. '
+                 . 'For Selcom, 9 digits without a leading 0 or 255.',
     ]) ?>
     <?= field_input([
         'name' => 'account_name', 'label' => 'Name on the account', 'required' => true,
@@ -371,5 +422,50 @@ if (Permission::has('request_withdrawal')):
         . '</form>';
 endif;
 ?>
+
+<?php if ($mayWithdraw): ?>
+<script>
+/*
+ * Tells you where you stand as you type, rather than after you submit.
+ * The server decides - this only saves a round trip.
+ */
+(function () {
+    var note = document.getElementById('withdraw-check');
+    var box  = document.querySelector('[data-withdraw-amount]');
+    if (!note || !box) { return; }
+
+    var minimum  = parseFloat(note.dataset.minimum) || 0;
+    var ceiling  = parseFloat(note.dataset.ceiling) || 0;
+    var currency = <?= json_encode((string)setting('currency', 'TSh')) ?>;
+
+    function money(value) {
+        return currency + ' ' + Math.round(value).toLocaleString('en-US');
+    }
+
+    function check() {
+        var value = parseFloat(box.value);
+
+        if (box.value === '' || isNaN(value)) {
+            note.textContent = '';
+            return;
+        }
+        if (value < minimum) {
+            note.style.color = 'var(--wms-warning)';
+            note.textContent = 'Too small. The smallest withdrawal is ' + money(minimum)
+                             + ' — add ' + money(minimum - value) + ' more.';
+        } else if (value > ceiling) {
+            note.style.color = 'var(--wms-danger)';
+            note.textContent = 'That is more than you have. You can send up to ' + money(ceiling) + '.';
+        } else {
+            note.style.color = 'var(--wms-success)';
+            note.textContent = money(value) + ' can be sent.';
+        }
+    }
+
+    box.addEventListener('input', check);
+    check();
+})();
+</script>
+<?php endif; ?>
 
 <?php require INCLUDES_PATH . '/footer.php'; ?>

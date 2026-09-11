@@ -19,9 +19,34 @@ if (!$provider) {
     Response::redirect('admin/providers/index.php', 'error', 'That provider could not be found.');
 }
 
-$db    = Database::getInstance();
-$stats = $providers->statistics($id);
-$staff = $providers->users($id);
+/* ------------------------------------------------------------ deleting -- */
+if (is_post()) {
+    CSRF::verify();
+
+    if (post('action') !== 'delete_provider') {
+        Response::back('error', 'That action is not supported.');
+    }
+
+    /*
+     * Typing the code is the confirmation. A provider carries its customers,
+     * vouchers, payments and staff with it, and none of that comes back, so
+     * a misplaced click must not be enough.
+     */
+    if (strtoupper(trim((string)post('confirm_code'))) !== strtoupper((string)$provider['provider_code'])) {
+        Response::back('error', 'The provider code did not match, so nothing was deleted.');
+    }
+
+    $result = $providers->deleteProvider($id);
+    if (!$result['ok']) {
+        Response::back('error', $result['message']);
+    }
+    Response::redirect('admin/providers/index.php', 'success', $result['message']);
+}
+
+$db     = Database::getInstance();
+$stats  = $providers->statistics($id);
+$staff  = $providers->users($id);
+$impact = $providers->deletionImpact($id);
 
 /* All figures below are explicitly filtered to this provider - the page runs
    in platform scope, so nothing is scoped for us automatically. */
@@ -423,6 +448,66 @@ require INCLUDES_PATH . '/admin-header.php';
                 <?php endforeach; ?>
                 </tbody>
             </table>
+        <?php endif; ?>
+    </div>
+</section>
+
+<!-- ===================================================== danger zone -->
+<section class="card mt-3" id="danger" style="border-color:var(--wms-danger)">
+    <div class="card__head">
+        <div>
+            <h2 class="card__title" style="color:var(--wms-danger)"><?= icon('alert') ?> Delete this provider</h2>
+            <p class="card__subtitle">Permanent. Suspending them keeps everything and is reversible.</p>
+        </div>
+    </div>
+    <div class="card__body">
+        <p class="small muted mt-0">
+            Deleting <b><?= e($provider['business_name']) ?></b> removes the business and everything
+            belonging to it. Their staff accounts are deleted with it, so nobody is left signed in to
+            a tenant that no longer exists. Only the audit log survives, kept against the platform.
+        </p>
+
+        <div class="divider-label">What would be deleted</div>
+        <?php
+        $lines = [];
+        foreach ($impact['counts'] as $what => $howMany) {
+            if ($howMany > 0) {
+                $lines[] = number_format($howMany) . ' ' . $what;
+            }
+        }
+        ?>
+        <p class="small<?= $lines ? '' : ' muted' ?>">
+            <?= $lines ? e(implode(' · ', $lines)) : 'Nothing yet — this provider has no data.' ?>
+        </p>
+
+        <?php if ($impact['blockers']): ?>
+            <?= alert_box('warning',
+                implode(' ', array_map('e', $impact['blockers'])),
+                'This provider cannot be deleted yet') ?>
+            <p class="small muted">
+                Money is the one thing deleting cannot undo, so it has to be settled first.
+                <a href="<?= e(url('admin/billing/index.php')) ?>">Open billing</a> to deal with it.
+            </p>
+        <?php else: ?>
+            <form method="post" action=""
+                  data-confirm="Delete <?= e($provider['business_name']) ?> and everything belonging to it? This cannot be undone."
+                  data-confirm-button="Delete permanently" data-confirm-tone="danger">
+                <?= CSRF::field() ?>
+                <input type="hidden" name="action" value="delete_provider">
+                <div style="max-width:420px">
+                    <?= field_input([
+                        'name'        => 'confirm_code',
+                        'label'       => 'Type the provider code to confirm',
+                        'required'    => true,
+                        'class'       => 'input--mono',
+                        'placeholder' => $provider['provider_code'],
+                        'hint'        => 'Enter ' . $provider['provider_code'] . ' exactly.',
+                    ]) ?>
+                </div>
+                <button class="btn btn--danger" type="submit">
+                    <?= icon('trash', 'ico--sm') ?> Delete this provider permanently
+                </button>
+            </form>
         <?php endif; ?>
     </div>
 </section>

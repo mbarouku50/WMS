@@ -768,7 +768,7 @@ INSERT INTO `settings` (`id`, `provider_id`, `setting_key`, `setting_value`, `se
 (43, 0, 'platform_fee_cycle_months', '1', 'billing', 'int', 'Default billing cycle in months', '2026-09-09 07:20:12'),
 (44, 0, 'platform_fee_grace_months', '1', 'billing', 'int', 'Default months before a new provider starts paying', '2026-09-09 07:20:12'),
 (45, 0, 'platform_fee_due_days', '7', 'billing', 'int', 'Days a provider has to settle an invoice', '2026-09-09 07:20:12'),
-(46, 0, 'withdrawal_minimum', '5000', 'billing', 'string', 'Smallest withdrawal a provider may request', '2026-09-09 07:20:12'),
+(46, 0, 'withdrawal_minimum', '30000', 'billing', 'string', 'Smallest withdrawal a provider may request', '2026-09-09 07:20:12'),
 (47, 0, 'withdrawal_requires_approval', '1', 'billing', 'bool', 'Platform must approve withdrawals before payout', '2026-09-09 07:20:12'),
 (48, 0, 'auto_charge_fee_from_wallet', '1', 'billing', 'bool', 'Take the platform fee from the wallet automatically', '2026-09-09 07:20:12'),
 (76, 0, 'cron_token', 'CHANGE_ME_CRON_TOKEN', 'general', 'secret', NULL, '2026-09-10 00:17:02'),
@@ -778,7 +778,7 @@ INSERT INTO `settings` (`id`, `provider_id`, `setting_key`, `setting_value`, `se
 (80, 0, 'platform_fee_stop_service_after_days', '0', 'billing', 'int', 'Extra days after the lock before customer service stops', '2026-09-10 21:12:37'),
 (81, 0, 'platform_fee_warn_days', '3', 'billing', 'int', 'Days before the deadline to remind the provider and send them to the pay screen', '2026-09-10 21:33:32'),
 (82, 0, 'platform_fee_pay_by_mobile', '1', 'billing', 'bool', 'Let a provider settle the fee straight from their phone', '2026-09-10 21:12:37'),
-(83, 0, 'platform_withdrawal_minimum', '5000', 'billing', 'string', 'Smallest amount the platform owner may withdraw', '2026-09-10 21:33:14');
+(83, 0, 'platform_withdrawal_minimum', '30000', 'billing', 'string', 'Smallest amount the platform owner may withdraw', '2026-09-10 21:33:14');
 
 -- --------------------------------------------------------
 
@@ -1326,6 +1326,7 @@ ALTER TABLE `voucher_batches`
 --
 ALTER TABLE `wallet_transactions`
   ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_wt_payment_type` (`payment_id`,`type`),
   ADD KEY `idx_wt_provider` (`provider_id`,`created_at`),
   ADD KEY `idx_wt_type` (`provider_id`,`type`),
   ADD KEY `idx_wt_payment` (`payment_id`),

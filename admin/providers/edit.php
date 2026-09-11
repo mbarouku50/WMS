@@ -43,10 +43,12 @@ $values = [
 
 if (is_post()) {
     CSRF::verify();
+    $derivedStatus = $values['billing_status'];      // never posted; shown only
     foreach ($values as $key => $default) {
         $values[$key] = post($key, (string)$default);
     }
     $values['mobile_money_enabled'] = Validator::bool(post('mobile_money_enabled'));
+    $values['billing_status']       = $derivedStatus;
 
     $errors = (new Validator($values))->rules([
         'business_name' => 'required|min:2|max:160',
@@ -108,11 +110,15 @@ if (is_post()) {
                 }
 
                 // Billing terms, if they changed.
+                /*
+                 * No status is passed: BillingService works it out from the
+                 * start date, the fee and the invoices that actually exist.
+                 * See the note in _form.php.
+                 */
                 (new BillingService())->setTerms($id, [
                     'fee'          => $values['platform_fee_amount'],
                     'cycle_months' => $values['platform_fee_cycle_months'],
                     'starts_on'    => $values['billing_starts_on'] ?: null,
-                    'status'       => $values['billing_status'] ?: null,
                 ]);
 
                 $providers->updateById($id, $data);
