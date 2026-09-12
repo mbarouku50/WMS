@@ -161,6 +161,42 @@ class MikroTikService implements NetworkProvider
         return $this->responseMs;
     }
 
+    /**
+     * Why a hotspot server exists but is not usable.
+     *
+     * Returns null when there is genuinely no server at all, so callers can
+     * keep telling that operator to run the setup - and a specific reason
+     * when a server is present but RouterOS has disabled it.
+     */
+    private static function hotspotBlockReason(array $servers): ?string
+    {
+        if ($servers === []) {
+            return null;
+        }
+
+        foreach ($servers as $srv) {
+            $reason = strtolower($srv['reason'] ?? '');
+            if (str_contains($reason, 'device-mode')) {
+                return 'The hotspot server "' . $srv['name'] . '" exists but RouterOS has disabled it:'
+                    . ' the router is in device-mode "home", which blocks the hotspot feature.'
+                    . ' Run /system/device-mode/update hotspot=yes and then confirm it by power-cycling'
+                    . ' the router or pressing its reset button - device-mode cannot be changed over'
+                    . ' the network alone. Do not create a second server; this one is configured correctly.';
+            }
+        }
+
+        foreach ($servers as $srv) {
+            if ($srv['invalid'] ?? false) {
+                return 'The hotspot server "' . $srv['name'] . '" is marked invalid by RouterOS.'
+                    . ' Check that its interface, address pool and profile all still exist.';
+            }
+        }
+
+        $names = implode(', ', array_column($servers, 'name'));
+        return 'A hotspot server already exists (' . $names . ') but is disabled.'
+            . ' Enable it under IP > Hotspot > Servers rather than creating another one.';
+    }
+
     /** Turns protocol errors into something a non-engineer can act on. */
     private function friendly(string $error): string
     {
@@ -171,6 +207,10 @@ class MikroTikService implements NetworkProvider
                                                                   => 'The router did not answer in time. It may be offline or unreachable from this server.',
             str_contains($lower, 'password') || str_contains($lower, 'login')
                                                                   => 'The router rejected the API username or password.',
+            // The port answered - prefixing "could not reach" would point the
+            // operator at the network instead of at the TLS setup.
+            str_contains($lower, 'handshake') || str_contains($lower, 'ssl')
+                || str_contains($lower, 'tls')                    => $error,
             default                                               => 'Could not reach the router. ' . $error,
         };
     }
@@ -545,6 +585,13 @@ class MikroTikService implements NetworkProvider
                 'profile'    => $row['profile'] ?? '',
                 'addresses'  => $row['address-pool'] ?? '',
                 'disabled'   => ($row['disabled'] ?? 'false') === 'true',
+                // RouterOS explains its own refusals in ".about" - notably
+                // "inactivated, not allowed by device-mode" on a router in
+                // home mode, where the server is configured correctly and
+                // still disabled. Without this the operator is told no server
+                // exists and goes off to create a duplicate.
+                'reason'     => trim((string)($row['.about'] ?? '')),
+                'invalid'    => ($row['invalid'] ?? 'false') === 'true',
             ];
         }
         return ['ok' => true, 'data' => $out, 'source' => 'live'];
@@ -818,7 +865,8 @@ class MikroTikService implements NetworkProvider
             'label'  => 'Hotspot configuration',
             'ok'     => $found,
             'detail' => match (true) {
-                $enabled === []                         => 'No RouterOS hotspot server detected. Run /ip hotspot setup on the router.',
+                $enabled === []                         => self::hotspotBlockReason($servers['data'] ?? [])
+                    ?? 'No RouterOS hotspot server detected. Run /ip hotspot setup on the router.',
                 !$found                                 => 'This router has no enabled hotspot server named "' . $configured . '". Available: ' . implode(', ', $facts['hotspots']) . '.',
                 $configured === '' || $configured === 'all' => 'Found: ' . implode(', ', $facts['hotspots']) . '.',
                 default                                 => 'Using "' . $configured . '".',
@@ -922,8 +970,11 @@ class MikroTikService implements NetworkProvider
             'ok'     => $servers['ok'] && $enabled !== [],
             'detail' => $enabled
                 ? count($enabled) . ' enabled: ' . implode(', ', array_column($enabled, 'name'))
-                : 'No enabled hotspot server. A voucher can be created on the router but it will not let anybody online.',
-            'fix'    => $enabled ? null : '/ip hotspot setup',
+                : (self::hotspotBlockReason($servers['data'] ?? [])
+                    ?? 'No enabled hotspot server. A voucher can be created on the router but it will not let anybody online.'),
+            'fix'    => $enabled
+                ? null
+                : (($servers['data'] ?? []) === [] ? '/ip hotspot setup' : '/system/device-mode/print'),
         ];
 
         /* 4. Are there addresses to hand out? */

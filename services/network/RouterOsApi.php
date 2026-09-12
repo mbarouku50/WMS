@@ -55,8 +55,24 @@ class RouterOsApi
         $this->lastError = '';
 
         $target = ($this->useTls ? 'ssl://' : 'tcp://') . $this->host . ':' . $this->port;
+
+        /*
+         * RouterOS only serves a certificate on api-ssl once one has been
+         * assigned to the service. Until then it offers nothing but the
+         * anonymous-DH suites (ADH-AES256-SHA256 and friends), which OpenSSL 3
+         * will not even put in the ClientHello at its default security level -
+         * so the handshake dies before login with an empty error string.
+         *
+         * HIGH comes first so a router that does have a certificate still
+         * negotiates a strong authenticated suite; ADH at SECLEVEL=0 is only
+         * there as the fallback a certificate-less api-ssl leaves us.
+         */
         $context = stream_context_create([
-            'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
+            'ssl' => [
+                'verify_peer'      => false,
+                'verify_peer_name' => false,
+                'ciphers'          => 'HIGH:ADH:@SECLEVEL=0',
+            ],
         ]);
 
         $errno  = 0;
@@ -64,7 +80,21 @@ class RouterOsApi
         $socket = @stream_socket_client($target, $errno, $errstr, $this->timeout, STREAM_CLIENT_CONNECT, $context);
 
         if (!$socket) {
-            $this->lastError = $errstr !== '' ? $errstr : 'Could not reach the router on ' . $this->host . ':' . $this->port;
+            /*
+             * A failed TLS handshake reports errno 0 and an empty message,
+             * which is not the same thing as an unreachable host - saying
+             * "could not reach" there sends the operator to check cables when
+             * the port answered fine. Separate the two.
+             */
+            if ($errstr !== '') {
+                $this->lastError = $errstr;
+            } elseif ($this->useTls && $errno === 0) {
+                $this->lastError = 'The TLS handshake with ' . $this->host . ':' . $this->port
+                    . ' failed. The port answered but would not negotiate TLS - check that this is the api-ssl'
+                    . ' port and that a certificate is assigned to it on the router.';
+            } else {
+                $this->lastError = 'Could not reach the router on ' . $this->host . ':' . $this->port;
+            }
             return false;
         }
 

@@ -57,8 +57,15 @@ class Router extends Model
 
     public function search(array $filters, int $page, int $perPage = 20): array
     {
-        [$scopeSql, $scopeParams] = $this->scope('r');
-        $where  = [$scopeSql];
+        /*
+         * parent::scope() plus an explicit soft-delete clause, so the one
+         * filter that is *about* retired routers can ask for them. Every
+         * other call still sees only working routers.
+         */
+        [$scopeSql, $scopeParams] = parent::scope('r');
+        $where  = [$scopeSql, ($filters['status'] ?? '') === 'retired'
+            ? 'r.deleted_at IS NOT NULL'
+            : 'r.deleted_at IS NULL'];
         $params = $scopeParams;
 
         if (!empty($filters['q'])) {
@@ -89,10 +96,20 @@ class Router extends Model
         }
         $whereSql = implode(' AND ', $where);
 
+        /*
+         * The dependency tallies ride along as subqueries rather than a
+         * dependencyCounts() call per card: the listing needs them for every
+         * row it draws, and asking row by row would be six queries a router.
+         */
         return $this->paginate(
             "SELECT r.*,
                     (SELECT COUNT(*) FROM access_points a WHERE a.router_id = r.id) AS ap_count,
-                    (SELECT COUNT(*) FROM sessions s WHERE s.router_id = r.id AND s.status = 'active') AS live_sessions
+                    (SELECT COUNT(*) FROM sessions s WHERE s.router_id = r.id AND s.status = 'active') AS live_sessions,
+                    (SELECT COUNT(*) FROM sessions s WHERE s.router_id = r.id) AS session_count,
+                    (SELECT COUNT(*) FROM vouchers v WHERE v.router_id = r.id) AS voucher_count,
+                    (SELECT COUNT(*) FROM voucher_batches b WHERE b.router_id = r.id) AS batch_count,
+                    (SELECT COUNT(*) FROM devices d WHERE d.router_id = r.id) AS device_count,
+                    (SELECT COUNT(*) FROM usage_records u WHERE u.router_id = r.id) AS usage_count
                FROM routers r WHERE $whereSql ORDER BY r.name ASC",
             "SELECT COUNT(*) FROM routers r WHERE $whereSql",
             $params,
@@ -374,16 +391,144 @@ class Router extends Model
         return true;
     }
 
-    /** Brings a retired router back. */
+    /**
+     * Brings a retired router back, in Demo mode and unknown state - nothing
+     * has been contacted since it was retired, so no reading is carried over.
+     *
+     * retire() stamps the router and its access points with the same
+     * deleted_at, so that timestamp identifies the access points that went
+     * down with this router. Only those come back; one retired on its own
+     * beforehand stays retired.
+     */
     public function restore(int $id): bool
     {
+        $row = $this->findWithRetired($id);
+        if (!$row || $row['deleted_at'] === null) {
+            return false;
+        }
+
         [$clause, $params] = parent::scope();
-        return $this->db->update(
+        $restored = $this->db->update(
             'routers',
-            ['deleted_at' => null, 'status' => 'unknown', 'failed_checks' => 0],
+            ['deleted_at' => null, 'status' => 'unknown', 'failed_checks' => 0, 'last_error' => null],
             'id = ? AND ' . $clause,
             array_merge([$id], $params)
         ) > 0;
+
+        if ($restored) {
+            $this->db->execute(
+                "UPDATE access_points SET status = 'unknown', deleted_at = NULL
+                  WHERE router_id = ? AND deleted_at = ? AND " . $clause,
+                array_merge([$id, $row['deleted_at']], $params)
+            );
+        }
+
+        return $restored;
+    }
+
+    /* --------------------------------------------------- hard deletion --- */
+
+    /**
+     * What a permanent delete would touch, for the operator to read first.
+     *
+     * Nothing here is destroyed by the delete except the access points: the
+     * five foreign keys pointing at routers are ON DELETE SET NULL, so the
+     * sessions, vouchers, batches and devices survive and only stop naming
+     * which router they happened on. usage_records carries no foreign key at
+     * all, so deletePermanently() clears it by hand.
+     *
+     * @return array{access_points:int,sessions:int,vouchers:int,batches:int,devices:int,usage:int}
+     */
+    public function dependencyCounts(int $id): array
+    {
+        [$clause, $params] = parent::scope();
+        $count = fn (string $table): int => $this->db->count(
+            'SELECT COUNT(*) FROM `' . $table . '` WHERE router_id = ? AND ' . $clause,
+            array_merge([$id], $params)
+        );
+
+        return [
+            'access_points' => $count('access_points'),
+            'sessions'      => $count('sessions'),
+            'vouchers'      => $count('vouchers'),
+            'batches'       => $count('voucher_batches'),
+            'devices'       => $count('devices'),
+            'usage'         => $count('usage_records'),
+        ];
+    }
+
+    /**
+     * Deletes a router for good - row and all. Retire() is the reversible
+     * option; this is the one that is not.
+     *
+     * findWithRetired(), so a retired router can be cleared out as easily as a
+     * working one, and so another provider's id still resolves to nothing.
+     *
+     * Business history is detached, not deleted - the foreign keys set
+     * router_id to NULL - so payments, vouchers, sessions and usage stay
+     * auditable and only stop naming the router. Two things go with it because
+     * they mean nothing without it: its access points, which are physically
+     * part of the router, and the alerts raised about it, which nobody could
+     * act on again.
+     *
+     * @return bool false when the id is not one of this provider's routers, or
+     *              when the delete failed (the reason is logged)
+     */
+    public function deletePermanently(int $id): bool
+    {
+        $row = $this->findWithRetired($id);
+        if (!$row) {
+            return false;
+        }
+
+        [$clause, $params] = parent::scope();
+        $providerId = $row['provider_id'] === null ? null : (int)$row['provider_id'];
+        $apIds = array_column($this->db->fetchAll(
+            'SELECT id FROM access_points WHERE router_id = ? AND ' . $clause,
+            array_merge([$id], $params)
+        ), 'id');
+
+        $this->db->beginTransaction();
+        try {
+            // Nothing else would clear this: usage_records.router_id has no
+            // foreign key, so the rows would keep citing an id that is gone.
+            $this->db->execute(
+                'UPDATE usage_records SET router_id = NULL WHERE router_id = ? AND ' . $clause,
+                array_merge([$id], $params)
+            );
+
+            foreach ($apIds as $apId) {
+                $this->db->execute(
+                    'DELETE FROM alerts WHERE source_type = ? AND source_id = ? AND (provider_id <=> ?)',
+                    ['access_point', (int)$apId, $providerId]
+                );
+            }
+            $this->db->execute(
+                'DELETE FROM alerts WHERE source_type = ? AND source_id = ? AND (provider_id <=> ?)',
+                ['router', $id, $providerId]
+            );
+
+            // An access point is part of a router; it cannot outlive one.
+            $this->db->execute(
+                'DELETE FROM access_points WHERE router_id = ? AND ' . $clause,
+                array_merge([$id], $params)
+            );
+
+            $deleted = $this->db->delete('routers', 'id = ? AND ' . $clause, array_merge([$id], $params)) > 0;
+            $this->db->commit();
+            return $deleted;
+        } catch (Throwable $e) {
+            $this->db->rollback();
+            /*
+             * Reported, not rethrown: an uncaught exception here would reach
+             * the operator as a blank HTTP 500, which says nothing at all.
+             * The caller turns false into a message it can act on.
+             */
+            Logger::error('Permanent router delete failed: ' . $e->getMessage(), [
+                'router_id' => $id, 'router_name' => $row['name'],
+            ]);
+            return false;
+        }
     }
 
     public function counts(): array
@@ -396,7 +541,21 @@ class Router extends Model
             'unknown'  => $this->countAll("status IN ('unknown','disabled')"),
             'live'     => $this->countAll("mode = 'live'"),
             'demo'     => $this->countAll("mode = 'demo'"),
+            'retired'  => $this->retiredCount(),
         ];
+    }
+
+    /**
+     * Retired routers. countAll() cannot answer this: Router::scope() filters
+     * them out, which is the whole point of it everywhere else.
+     */
+    public function retiredCount(): int
+    {
+        [$clause, $params] = parent::scope();
+        return $this->db->count(
+            'SELECT COUNT(*) FROM routers WHERE deleted_at IS NOT NULL AND ' . $clause,
+            $params
+        );
     }
 
     public function accessPoints(int $routerId): array
@@ -408,10 +567,35 @@ class Router extends Model
         );
     }
 
+    /**
+     * The retired router holding a name, when that is what is blocking it.
+     *
+     * Lets the caller tell the two cases apart: another working router has
+     * the name (pick a different one), or a retired one still reserves it
+     * and restoring it brings back the router and its history.
+     */
+    public function findRetiredByName(string $name): ?array
+    {
+        [$clause, $params] = parent::scope();
+        return $this->db->fetchOne(
+            'SELECT * FROM routers WHERE name = ? AND deleted_at IS NOT NULL AND ' . $clause . ' LIMIT 1',
+            array_merge([$name], $params)
+        );
+    }
+
+    /**
+     * Is this name already used by one of this provider's routers?
+     *
+     * parent::scope() on purpose, not $this->scope(): the check has to match
+     * uq_routers_provider_name, which covers every row in the table including
+     * retired ones. Filtering retired routers out here reported a free name
+     * and then let the INSERT fail on the index - a raw duplicate-key
+     * exception, which reaches the operator as HTTP 500.
+     */
     public function isNameTaken(string $name, ?int $exceptId = null): bool
     {
         // Router names stay unique per provider, not across the platform.
-        [$scopeSql, $scopeParams] = $this->scope();
+        [$scopeSql, $scopeParams] = parent::scope();
         $sql    = "SELECT COUNT(*) FROM routers WHERE name = ? AND $scopeSql";
         $params = array_merge([$name], $scopeParams);
         if ($exceptId) {

@@ -65,8 +65,19 @@ if (is_post()) {
                 'mode'                 => 'required|in:live,demo',
             ])->errors();
 
+        /*
+         * The name must be free against every row, retired ones included:
+         * uq_routers_provider_name spans the whole table. A retired router
+         * still reserving the name is the interesting case - restoring it
+         * gives the operator the router back with its history attached,
+         * which is nearly always what was meant by re-adding it.
+         */
         if (!$errors && $routers->isNameTaken($values['name'], $id ?: null)) {
-            $errors['name'] = 'Another of your routers already uses that name.';
+            $retired = $routers->findRetiredByName($values['name']);
+            $errors['name'] = $retired && (int)$retired['id'] !== $id
+                ? 'A retired router still holds the name "' . $values['name'] . '". Restore it from the '
+                  . 'Retired filter on this page to get it back with its history, or choose another name.'
+                : 'Another of your routers already uses that name.';
         }
 
         $useTls = $values['connection_type'] === 'api_tls';
@@ -151,6 +162,54 @@ if (is_post()) {
     }
 
     /* ------------------------------------------------------ lifecycle ---- */
+
+    /*
+     * Restore is the one action whose subject is retired by definition, so it
+     * looks the router up with findWithRetired() rather than find().
+     */
+    if ($action === 'restore') {
+        $retired = $id ? $routers->findWithRetired($id) : null;
+        if (!$retired || $retired['deleted_at'] === null) {
+            Response::back('error', 'That retired router could not be found.');
+        }
+        $routers->restore($id);
+        AuditLog::record('RESTORE_ROUTER', 'router', $id,
+            'Restored retired router "' . $retired['name'] . '" with its access points');
+        Response::back('success', 'Router "' . $retired['name'] . '" is back in your list, in Demo mode. '
+            . 'Nothing was contacted while it was retired, so switch it to Live and test the connection '
+            . 'before relying on its readings.');
+    }
+
+    /*
+     * Permanent delete - the one action on this page that cannot be undone.
+     * findWithRetired(), because a retired router is the commonest thing to
+     * want gone and find() cannot see one.
+     */
+    if ($action === 'delete') {
+        $doomed = $id ? $routers->findWithRetired($id) : null;
+        if (!$doomed) {
+            Response::back('error', 'That router could not be found.');
+        }
+
+        // Counted before the delete - afterwards there is nothing left to ask.
+        $deps = $routers->dependencyCounts($id);
+        if (!$routers->deletePermanently($id)) {
+            Response::back('error', 'Router "' . $doomed['name'] . '" could not be deleted. Nothing was changed; '
+                . 'the reason is in the application log.');
+        }
+
+        AuditLog::record('DELETE_ROUTER', 'router', $id,
+            'Permanently deleted router "' . $doomed['name'] . '" - '
+            . $deps['access_points'] . ' access points deleted with it; '
+            . $deps['sessions'] . ' sessions, ' . $deps['vouchers'] . ' vouchers, '
+            . $deps['batches'] . ' voucher batches, ' . $deps['devices'] . ' devices and '
+            . $deps['usage'] . ' usage records kept but no longer naming a router');
+        Response::redirect('admin/network/routers.php', 'success',
+            'Router "' . $doomed['name'] . '" is deleted and its name is free to use again. Its sessions, '
+            . 'vouchers and payments are still in your records - they simply no longer say which router they '
+            . 'were on.');
+    }
+
     $record = $id ? $routers->find($id) : null;
     if (in_array($action, ['retire', 'poll', 'disable', 'enable'], true) && !$record) {
         Response::back('error', 'That router could not be found.');
@@ -243,6 +302,21 @@ require INCLUDES_PATH . '/admin-header.php';
 
 <div id="router-test-result"></div>
 
+<?php if ($counts['retired'] > 0 && ($filters['status'] ?? '') !== 'retired'): ?>
+    <section class="card mb-3"><div class="card__body flex justify-between items-center flex-wrap gap-1">
+        <span class="small">
+            <?= icon('history', 'ico--sm') ?>
+            <b><?= (int)$counts['retired'] ?></b> retired router<?= $counts['retired'] === 1 ? '' : 's' ?>
+            kept for history.
+            <span class="muted">A retired router keeps its name reserved until it is restored, so that
+            name cannot be given to a new router.</span>
+        </span>
+        <a class="btn btn--sm" href="<?= e(url('admin/network/routers.php?status=retired')) ?>">
+            <?= icon('history', 'ico--sm') ?> View retired
+        </a>
+    </div></section>
+<?php endif; ?>
+
 <?php if (!$page['rows'] && !array_filter($filters)): ?>
     <div class="card"><div class="card__body">
         <?= empty_state([
@@ -266,7 +340,7 @@ require INCLUDES_PATH . '/admin-header.php';
         <?= search_field($filters['q'], 'Search name, address, location or identity…') ?>
         <?= filter_select('status', $filters['status'], [
             'online' => 'Online', 'degraded' => 'Degraded', 'offline' => 'Offline',
-            'unknown' => 'Unknown', 'disabled' => 'Disabled',
+            'unknown' => 'Unknown', 'disabled' => 'Disabled', 'retired' => 'Retired',
         ], 'Any status') ?>
         <?= filter_select('mode', $filters['mode'], ['live' => 'Live', 'demo' => 'Demo'], 'Any mode') ?>
         <?php if ($providerOptions): ?>
@@ -299,6 +373,38 @@ require INCLUDES_PATH . '/admin-header.php';
         $isLive   = $router['mode'] === 'live';
         $stale    = Router::isStale($router);
         $degraded = Router::degradedReason($router);
+        // A retired router is never contacted again, so none of the actions
+        // that would talk to it - or retire it twice - belong on its card.
+        $isRetired = $router['status'] === 'retired';
+
+        /*
+         * Deleting cannot be undone, so the confirmation is built from this
+         * router's own figures rather than worded in general terms: what goes
+         * with it, what survives without it, and what it frees up. The tallies
+         * come off the row - search() counts them in the listing query.
+         */
+        $apCount = (int)$router['ap_count'];
+        $kept    = array_values(array_filter([
+            (int)$router['session_count'] ? (int)$router['session_count'] . ' sessions'       : null,
+            (int)$router['voucher_count'] ? (int)$router['voucher_count'] . ' vouchers'       : null,
+            (int)$router['batch_count']   ? (int)$router['batch_count'] . ' voucher batches'  : null,
+            (int)$router['device_count']  ? (int)$router['device_count'] . ' devices'         : null,
+            (int)$router['usage_count']   ? (int)$router['usage_count'] . ' usage records'    : null,
+        ]));
+        $deleteConfirm = 'Delete ' . $router['name'] . ' permanently? This cannot be undone.';
+        if ($isLive) {
+            $deleteConfirm .= ' This router is LIVE'
+                . ((int)$router['live_sessions'] > 0 ? ' with ' . (int)$router['live_sessions'] . ' active sessions' : '')
+                . ' - WMS will stop enforcing access through it.';
+        }
+        if ($apCount) {
+            $deleteConfirm .= ' Its ' . $apCount . ' access point'
+                . ($apCount === 1 ? ' is' : 's are') . ' deleted with it.';
+        }
+        $deleteConfirm .= $kept
+            ? ' ' . implode(', ', $kept) . ' are kept, but will no longer say which router they were on.'
+            : ' No sessions, vouchers or usage records reference it.';
+        $deleteConfirm .= ' The name "' . $router['name'] . '" becomes free again.';
         ?>
         <section class="card router-card">
             <div class="router-card__top">
@@ -344,13 +450,21 @@ require INCLUDES_PATH . '/admin-header.php';
                         <a class="dropdown__item" href="<?= e(url('admin/network/router-setup.php?id=' . (int)$router['id'])) ?>"><?= icon('clipboard', 'ico--sm') ?> Readiness check</a>
                         <a class="dropdown__item" href="<?= e(url('admin/network/access-points.php?router_id=' . (int)$router['id'])) ?>"><?= icon('antenna', 'ico--sm') ?> Access points (<?= (int)$router['ap_count'] ?>)</a>
                         <a class="dropdown__item" href="<?= e(url('admin/network/sessions.php?router_id=' . (int)$router['id'])) ?>"><?= icon('activity', 'ico--sm') ?> Sessions (<?= (int)$router['live_sessions'] ?>)</a>
+                        <?php if (!$isRetired): ?>
                         <form method="post">
                             <?= CSRF::field() ?>
                             <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
                             <button class="dropdown__item" name="action" value="poll"><?= icon('refresh', 'ico--sm') ?> Sync now</button>
                         </form>
+                        <?php endif; ?>
                         <div class="dropdown__divider"></div>
-                        <?php if ($router['status'] === 'disabled'): ?>
+                        <?php if ($isRetired): ?>
+                            <form method="post">
+                                <?= CSRF::field() ?>
+                                <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
+                                <button class="dropdown__item" name="action" value="restore"><?= icon('history', 'ico--sm') ?> Restore router</button>
+                            </form>
+                        <?php elseif ($router['status'] === 'disabled'): ?>
                             <form method="post">
                                 <?= CSRF::field() ?>
                                 <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
@@ -363,10 +477,20 @@ require INCLUDES_PATH . '/admin-header.php';
                                 <button class="dropdown__item" name="action" value="disable"><?= icon('block', 'ico--sm') ?> Disable</button>
                             </form>
                         <?php endif; ?>
+                        <?php if (!$isRetired): ?>
                         <form method="post" data-confirm="Retire <?= e($router['name']) ?>? It is removed from your router list and never contacted again. Its sessions, vouchers, payments and audit history are kept.">
                             <?= CSRF::field() ?>
                             <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
                             <button class="dropdown__item dropdown__item--danger" name="action" value="retire"><?= icon('history', 'ico--sm') ?> Retire router</button>
+                        </form>
+                        <?php endif; ?>
+                        <div class="dropdown__divider"></div>
+                        <form method="post" data-confirm="<?= e($deleteConfirm) ?>"
+                              data-confirm-title="Delete <?= e($router['name']) ?> permanently"
+                              data-confirm-button="Delete permanently">
+                            <?= CSRF::field() ?>
+                            <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
+                            <button class="dropdown__item dropdown__item--danger" name="action" value="delete"><?= icon('trash', 'ico--sm') ?> Delete permanently</button>
                         </form>
                     </div>
                 </div>
@@ -402,10 +526,18 @@ require INCLUDES_PATH . '/admin-header.php';
                 </span>
                 <span class="flex gap-1">
                     <a class="btn btn--sm" href="<?= e($viewUrl) ?>"><?= icon('eye', 'ico--sm') ?> View</a>
-                    <a class="btn btn--sm" href="<?= e(url('admin/network/routers.php?edit=' . (int)$router['id'])) ?>"><?= icon('edit', 'ico--sm') ?> Edit</a>
-                    <button class="btn btn--sm btn--primary" data-router-test="<?= (int)$router['id'] ?>" data-result="#router-test-result">
-                        <?= icon('link', 'ico--sm') ?> Test connection
-                    </button>
+                    <?php if ($isRetired): ?>
+                        <form method="post" data-confirm="Restore <?= e($router['name']) ?>? It comes back in Demo mode with its access points, and its name is in use again.">
+                            <?= CSRF::field() ?>
+                            <input type="hidden" name="id" value="<?= (int)$router['id'] ?>">
+                            <button class="btn btn--sm btn--primary" name="action" value="restore"><?= icon('history', 'ico--sm') ?> Restore</button>
+                        </form>
+                    <?php else: ?>
+                        <a class="btn btn--sm" href="<?= e(url('admin/network/routers.php?edit=' . (int)$router['id'])) ?>"><?= icon('edit', 'ico--sm') ?> Edit</a>
+                        <button class="btn btn--sm btn--primary" data-router-test="<?= (int)$router['id'] ?>" data-result="#router-test-result">
+                            <?= icon('link', 'ico--sm') ?> Test connection
+                        </button>
+                    <?php endif; ?>
                 </span>
             </div>
         </section>
